@@ -47,7 +47,7 @@ impl<R: Runtime> BtclassicSpp<R> {
 
     pub fn get_connected_device_info(&self) -> anyhow::Result<SPPDevice> {
         core::get_connected_device_info_impl()?
-            .ok_or_else(|| anyhow::anyhow!("No device connected or info unavailable"))
+            .ok_or_else(|| corelib::anyhow_site!("No device connected or info unavailable"))
     }
 
     pub fn on_connected<F>(&self, cb: F) -> anyhow::Result<()>
@@ -77,7 +77,7 @@ impl<R: Runtime> BtclassicSpp<R> {
             Ok(()) => Ok(()),
             Err(err) => {
                 log::error!("send msg error {}", err);
-                Err(anyhow::anyhow!(err))
+                Err(corelib::anyhow_site!("{}", err))
             }
         }
     }

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{mpsc, Arc, Mutex};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use dispatch::Queue;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
@@ -221,12 +221,12 @@ fn start_inquiry(delegate: &BTDelegate) -> Result<()> {
     /* 新建对象 */
     let inquiry: Retained<IOBluetoothDeviceInquiry> =
         unsafe { IOBluetoothDeviceInquiry::inquiryWithDelegate(Some(delegate)) }
-            .ok_or_else(|| anyhow!("Failed to create Bluetooth inquiry"))?;
+            .ok_or_else(|| corelib::anyhow_site!("Failed to create Bluetooth inquiry"))?;
 
     unsafe { inquiry.setUpdateNewDeviceNames(true) };
     let status = unsafe { inquiry.start() };
     if status != kIOReturnSuccess {
-        bail!("Failed to start scan, error code: {}", status);
+        corelib::bail_site!("Failed to start scan, error code: {}", status);
     }
 
     /* 保存到 TLS */
@@ -289,7 +289,7 @@ pub mod core {
     pub fn get_scanned_devices_impl() -> Result<Vec<SPPDevice>> {
         Ok(SHARED_BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+            .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .scanned_devices
             .clone())
     }
@@ -333,7 +333,7 @@ pub mod core {
                     msg_send![IOBluetoothDevice::class(), deviceWithAddressString: Some(&*addr_ns)]
                 }
             };
-            let dev = dev_opt.ok_or_else(|| anyhow!("Device not found for {}", addr))?;
+            let dev = dev_opt.ok_or_else(|| corelib::anyhow_site!("Device not found for {}", addr))?;
 
             unsafe {
                 let dev_ref: &IOBluetoothDevice = &*dev;
@@ -367,7 +367,7 @@ pub mod core {
                     /* 提前写入 pending device，保持原 Windows 语义 */
                     SHARED_BT_STATE
                         .lock()
-                        .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+                        .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
                         .connected_device_info = Some(SPPDevice {
                         name: unsafe { dev.nameOrAddress() }.map(|s| s.to_string()),
                         address: addr.clone(),
@@ -381,14 +381,14 @@ pub mod core {
             }
 
             /* 全部通道失败 */
-            bail!("All RFCOMM channel attempts failed (last={:?})", last_error);
+            corelib::bail_site!("All RFCOMM channel attempts failed (last={:?})", last_error);
         })
     }
 
     pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
         Ok(SHARED_BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+            .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .connected_device_info
             .clone())
     }
@@ -397,7 +397,7 @@ pub mod core {
     pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
         SHARED_BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+            .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .on_connected_callback = Some(cb);
         Ok(())
     }
@@ -407,7 +407,7 @@ pub mod core {
     ) -> Result<()> {
         SHARED_BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+            .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .data_listener_callback = Some(cb);
         Ok(())
     }
@@ -430,10 +430,10 @@ pub mod core {
                     if ret == kIOReturnSuccess {
                         Ok(())
                     } else {
-                        Err(anyhow!("Failed to send data, error code: {}", ret))
+                        Err(corelib::anyhow_site!("Failed to send data, error code: {}", ret))
                     }
                 } else {
-                    Err(anyhow!("Device not connected, cannot send data"))
+                    Err(corelib::anyhow_site!("Device not connected, cannot send data"))
                 }
             })
         })
@@ -456,7 +456,7 @@ pub mod core {
             }
             SHARED_BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to acquire Bluetooth state lock"))?
+                .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
                 .connected_device_info = None;
             Ok(())
         })

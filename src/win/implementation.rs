@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 
@@ -45,7 +45,7 @@ fn bth_addr_to_string(addr: u64) -> String {
 fn string_to_bth_addr(addr_str: &str) -> Result<u64> {
     let parts: Vec<&str> = addr_str.split(':').collect();
     if parts.len() != 6 {
-        bail!("Invalid Bluetooth address format: {}", addr_str);
+        corelib::bail_site!("Invalid Bluetooth address format: {}", addr_str);
     }
     let mut bytes = [0u8; 8];
     for i in 0..6 {
@@ -69,11 +69,11 @@ fn get_first_radio_handle() -> Result<HANDLE> {
         let find_handle: HBLUETOOTH_RADIO_FIND =
             BluetoothFindFirstRadio(&mut params, &mut radio_handle)?;
         if find_handle.is_invalid() {
-            bail!("No Bluetooth radios found");
+            corelib::bail_site!("No Bluetooth radios found");
         }
         BluetoothFindRadioClose(find_handle).ok();
         if radio_handle.is_invalid() {
-            bail!("Failed to acquire bluetooth radio handle");
+            corelib::bail_site!("Failed to acquire bluetooth radio handle");
         }
         Ok(radio_handle)
     }
@@ -123,12 +123,12 @@ pub mod core {
     fn init_winsock_if_needed() -> Result<()> {
         let mut state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for winsock init"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for winsock init"))?;
         if !state.wsa_initialized {
             let mut wsa_data = WSADATA::default();
             let result = unsafe { WSAStartup(0x0202, &mut wsa_data) };
             if result != 0 {
-                bail!("WSAStartup failed with error: {}", result);
+                corelib::bail_site!("WSAStartup failed with error: {}", result);
             }
             state.wsa_initialized = true;
             info!("WinSock initialized.");
@@ -197,7 +197,7 @@ pub mod core {
         let state_clone_for_thread = Arc::clone(&BT_STATE);
         let mut state_guard = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for start_scan"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for start_scan"))?;
 
         if state_guard.is_scanning {
             info!("Scan already in progress.");
@@ -365,7 +365,7 @@ pub mod core {
         let (stop_event_opt, thread_handle_opt) = {
             let mut state = BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to lock BT_STATE for stop_scan"))?;
+                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for stop_scan"))?;
 
             if !state.is_scanning && state.scan_thread_handle.is_none() {
                 return Ok(());
@@ -386,7 +386,7 @@ pub mod core {
             info!("Waiting for scan thread to join...");
             handle
                 .join()
-                .map_err(|e| anyhow!("Failed to join scan thread: {:?}", e))?;
+                .map_err(|e| corelib::anyhow_site!("Failed to join scan thread: {:?}", e))?;
             info!("Scan thread joined successfully.");
         }
 
@@ -405,7 +405,7 @@ pub mod core {
     pub fn get_scanned_devices_impl() -> Result<Vec<SPPDevice>> {
         let state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for get_scanned_devices"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for get_scanned_devices"))?;
         Ok(state.scanned_devices.clone())
     }
 
@@ -427,12 +427,14 @@ pub mod core {
         } else if let Some(ch) = port_channel {
             sockaddr.port = ch;
         } else {
-            bail!("Either service_guid or port_channel must be specified for connect attempt");
+            corelib::bail_site!(
+                "Either service_guid or port_channel must be specified for connect attempt"
+            );
         }
 
         let sock = unsafe { socket(AF_BTH.into(), SOCK_STREAM.into(), BTHPROTO_RFCOMM.into()) };
         if sock == INVALID_SOCKET {
-            bail!("Failed to create socket: {}", unsafe {
+            corelib::bail_site!("Failed to create socket: {}", unsafe {
                 WSAGetLastError().0
             });
         }
@@ -458,7 +460,7 @@ pub mod core {
             unsafe { closesocket(sock) };
             let bail_service_class_id = sockaddr.serviceClassId;
             let bail_port = sockaddr.port;
-            bail!(
+            corelib::bail_site!(
                 "Connection failed for service {:032X}/port {}: Win32 Error {}",
                 bail_service_class_id.to_u128(),
                 bail_port,
@@ -488,7 +490,7 @@ pub mod core {
         let old_join_handle_opt = {
             let mut state = BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to lock BT_STATE for connect"))?;
+                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for connect"))?;
 
             if let Some(ref dev_info) = state.connected_device_info {
                 if dev_info.address == addr_str {
@@ -590,7 +592,7 @@ pub mod core {
         let cb_ptr_opt: Option<ConnectedCallbackPtr> = {
             let mut state = BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to lock BT_STATE post connection"))?;
+                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE post connection"))?;
 
             let stop_event = unsafe { CreateEventW(None, TRUE, FALSE, PCWSTR::null())? };
             state.connection_handles = Some(ConnectedThreadHandles {
@@ -620,7 +622,7 @@ pub mod core {
     pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
         let state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for get_connected_device_info"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for get_connected_device_info"))?;
         Ok(state.connected_device_info.clone())
     }
 
@@ -628,7 +630,7 @@ pub mod core {
         let should_call_now = {
             let state = BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to lock BT_STATE for on_connected (check)"))?;
+                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (check)"))?;
             state.connected_device_info.is_some()
         };
 
@@ -638,7 +640,7 @@ pub mod core {
 
         let mut state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for on_connected (store)"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (store)"))?;
         state.on_connected_callback = Some(cb);
         Ok(())
     }
@@ -648,7 +650,7 @@ pub mod core {
     ) -> Result<()> {
         let mut state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for set_data_listener"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for set_data_listener"))?;
         state.data_listener_callback = Some(cb);
         Ok(())
     }
@@ -656,7 +658,7 @@ pub mod core {
     pub fn start_subscription_impl() -> Result<()> {
         let (sock_copy_opt, stop_event_for_thread_opt, can_start) = {
             let state_guard = BT_STATE.lock().map_err(|_| {
-                anyhow!("Failed to lock BT_STATE for start_subscription (initial check)")
+                corelib::anyhow_site!("Failed to lock BT_STATE for start_subscription (initial check)")
             })?;
 
             if let Some(ref handles) = state_guard.connection_handles {
@@ -673,7 +675,7 @@ pub mod core {
 
         if !can_start {
             if sock_copy_opt.is_none() {
-                bail!("Not connected. Cannot start subscription.");
+                corelib::bail_site!("Not connected. Cannot start subscription.");
             }
             return Ok(());
         }
@@ -682,7 +684,7 @@ pub mod core {
         let stop_event_for_thread = stop_event_for_thread_opt.unwrap();
 
         let mut state_guard = BT_STATE.lock().map_err(|_| {
-            anyhow!("Failed to lock BT_STATE for start_subscription (update handle)")
+            corelib::anyhow_site!("Failed to lock BT_STATE for start_subscription (update handle)")
         })?;
 
         match state_guard.connection_handles {
@@ -790,7 +792,7 @@ pub mod core {
     pub fn send_impl(data: &[u8]) -> Result<()> {
         let state = BT_STATE
             .lock()
-            .map_err(|_| anyhow!("Failed to lock BT_STATE for send"))?;
+            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for send"))?;
         if let Some(ref handles) = state.connection_handles {
             let mut total_sent = 0;
             while total_sent < data.len() {
@@ -798,12 +800,12 @@ pub mod core {
                 if sent > 0 {
                     total_sent += sent as usize;
                 } else {
-                    bail!("send failed with error: {}", unsafe { WSAGetLastError().0 });
+                    corelib::bail_site!("send failed with error: {}", unsafe { WSAGetLastError().0 });
                 }
             }
             Ok(())
         } else {
-            bail!("Not connected. Cannot send data.")
+            corelib::bail_site!("Not connected. Cannot send data.")
         }
     }
 
@@ -838,7 +840,7 @@ pub mod core {
         let join_handle_opt = {
             let mut state = BT_STATE
                 .lock()
-                .map_err(|_| anyhow!("Failed to lock BT_STATE for disconnect"))?;
+                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for disconnect"))?;
             disconnect_internal(&mut state)
         };
 

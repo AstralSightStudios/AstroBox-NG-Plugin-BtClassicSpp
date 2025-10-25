@@ -1,7 +1,7 @@
 // plugins/btclassic-spp/src/linux/implementation.rs
 
 use crate::models::SPPDevice;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use bluer::rfcomm::{SocketAddr, Stream};
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session};
 use futures_util::stream::StreamExt;
@@ -208,7 +208,7 @@ pub mod core {
             RUNTIME.block_on(async move {
                 let addr: Address = addr_clone
                     .parse()
-                    .map_err(|e| anyhow!("Invalid address format: {}", e))?;
+                    .map_err(|e| corelib::anyhow_site!("Invalid address format: {}", e))?;
 
                 let channels_to_try = [5, 1];
                 let mut stream: Option<Stream> = None;
@@ -251,7 +251,7 @@ pub mod core {
                     }
                     Ok(true)
                 } else {
-                    Err(anyhow!("Failed to connect on all attempted channels"))
+                    Err(corelib::anyhow_site!("Failed to connect on all attempted channels"))
                 }
             })
         })
@@ -292,11 +292,11 @@ pub mod core {
             let sock = st
                 .socket_stream
                 .clone()
-                .ok_or_else(|| anyhow!("Not connected"))?;
+                .ok_or_else(|| corelib::anyhow_site!("Not connected"))?;
             let cb = st
                 .data_listener_callback
                 .clone()
-                .ok_or_else(|| anyhow!("Data listener not set"))?;
+                .ok_or_else(|| corelib::anyhow_site!("Data listener not set"))?;
             let flag = Arc::new(AtomicBool::new(false));
             st.read_stop = Some(flag.clone());
             (sock, cb, flag)
@@ -344,7 +344,7 @@ pub mod core {
             let st = STATE.lock().unwrap();
             st.socket_stream
                 .clone()
-                .ok_or_else(|| anyhow!("Not connected"))?
+                .ok_or_else(|| corelib::anyhow_site!("Not connected"))?
         };
         let data_clone = data.to_vec();
 

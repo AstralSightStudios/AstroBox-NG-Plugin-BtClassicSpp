@@ -34,6 +34,7 @@ windows = { version = "0.57", features = [
   "Win32_System_IO",            # For CreateFile, ReadFile, WriteFile if used (not directly in this SPP, but good for general BT)
   "Win32_System_SystemServices" # For some system-level constants if not in other modules
 ] }
+corelib = { path = "../../modules/core" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-io-bluetooth = "0.3.1"
