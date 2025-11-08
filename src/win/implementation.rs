@@ -34,6 +34,26 @@ const SPP_SERVICE_CLASS_UUID: GUID = GUID::from_u128(0x00001101_0000_1000_8000_0
 type ConnectedCallbackPtr = *const (dyn Fn() + Send + Sync + 'static);
 type DataListenerPtr = *mut (dyn FnMut(Result<Vec<u8>, String>) + Send + 'static);
 
+#[derive(Clone, Copy, Default)]
+struct SharedHandle(HANDLE);
+
+impl SharedHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
+    fn raw(self) -> HANDLE {
+        self.0
+    }
+
+    fn is_invalid(self) -> bool {
+        self.0.is_invalid()
+    }
+}
+
+unsafe impl Send for SharedHandle {}
+unsafe impl Sync for SharedHandle {}
+
 fn bth_addr_to_string(addr: u64) -> String {
     let bytes = addr.to_be_bytes();
     format!(
@@ -82,14 +102,14 @@ fn get_first_radio_handle() -> Result<HANDLE> {
 struct ConnectedThreadHandles {
     socket: SOCKET,
     read_thread_handle: Option<thread::JoinHandle<()>>,
-    stop_event: HANDLE,
+    stop_event: SharedHandle,
 }
 
 struct GlobalState {
     wsa_initialized: bool,
     scanned_devices: Vec<SPPDevice>,
     is_scanning: bool,
-    scan_stop_event: Option<HANDLE>,
+    scan_stop_event: Option<SharedHandle>,
     scan_thread_handle: Option<thread::JoinHandle<()>>,
     connected_device_info: Option<SPPDevice>,
     connection_handles: Option<ConnectedThreadHandles>,
@@ -171,7 +191,7 @@ pub mod core {
 
         if let Some(stop_event) = scan_stop_event_opt {
             unsafe {
-                SetEvent(stop_event).ok();
+                SetEvent(stop_event.raw()).ok();
             }
         }
         if let Some(handle) = scan_thread_handle_opt {
@@ -205,11 +225,16 @@ pub mod core {
         }
         state_guard.scanned_devices.clear();
 
-        let stop_event_handle = unsafe { CreateEventW(None, TRUE, FALSE, PCWSTR::null())? };
+        let stop_event_handle = SharedHandle::new(unsafe {
+            CreateEventW(None, TRUE.into(), FALSE.into(), PCWSTR::null())?
+        });
         state_guard.scan_stop_event = Some(stop_event_handle);
         state_guard.is_scanning = true;
 
+        let stop_event_for_thread = stop_event_handle;
+
         state_guard.scan_thread_handle = Some(thread::spawn(move || {
+            let stop_event_handle = stop_event_for_thread.raw();
             const INQUIRY_CYCLE_PAUSE_MS: u32 = 3000;
 
             'outer_scan_loop: loop {
@@ -379,7 +404,7 @@ pub mod core {
 
         if let Some(stop_event) = stop_event_opt {
             info!("Signaling scan thread to stop...");
-            unsafe { SetEvent(stop_event).context("Failed to set scan stop event")? };
+            unsafe { SetEvent(stop_event.raw()).context("Failed to set scan stop event")? };
         }
 
         if let Some(handle) = thread_handle_opt {
@@ -394,7 +419,7 @@ pub mod core {
             if !stop_event.is_invalid() {
                 info!("Closing scan stop event handle.");
                 unsafe {
-                    CloseHandle(stop_event).ok();
+                    CloseHandle(stop_event.raw()).ok();
                 }
             }
         }
@@ -403,9 +428,9 @@ pub mod core {
     }
 
     pub fn get_scanned_devices_impl() -> Result<Vec<SPPDevice>> {
-        let state = BT_STATE
-            .lock()
-            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for get_scanned_devices"))?;
+        let state = BT_STATE.lock().map_err(|_| {
+            corelib::anyhow_site!("Failed to lock BT_STATE for get_scanned_devices")
+        })?;
         Ok(state.scanned_devices.clone())
     }
 
@@ -432,7 +457,7 @@ pub mod core {
             );
         }
 
-        let sock = unsafe { socket(AF_BTH.into(), SOCK_STREAM.into(), BTHPROTO_RFCOMM.into()) };
+        let sock = unsafe { socket(AF_BTH.into(), SOCK_STREAM.into(), BTHPROTO_RFCOMM.into())? };
         if sock == INVALID_SOCKET {
             corelib::bail_site!("Failed to create socket: {}", unsafe {
                 WSAGetLastError().0
@@ -527,8 +552,10 @@ pub mod core {
             }
         };
 
+        let radio_handle_opt = (!radio_handle.is_invalid()).then_some(radio_handle);
+
         let get_device_info_err =
-            unsafe { BluetoothGetDeviceInfo(radio_handle, &mut device_info_struct) };
+            unsafe { BluetoothGetDeviceInfo(radio_handle_opt, &mut device_info_struct) };
         if get_device_info_err != ERROR_SUCCESS.0 {
             warn!(
                 "BluetoothGetDeviceInfo for {} failed initially or device not remembered. Error code: {}. This is expected for unbonded devices.",
@@ -552,7 +579,7 @@ pub mod core {
             let auth_result = unsafe {
                 BluetoothAuthenticateDeviceEx(
                     None,
-                    radio_handle,
+                    radio_handle_opt,
                     &mut device_info_struct,
                     None,
                     MITMProtectionNotRequired,
@@ -594,7 +621,9 @@ pub mod core {
                 .lock()
                 .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE post connection"))?;
 
-            let stop_event = unsafe { CreateEventW(None, TRUE, FALSE, PCWSTR::null())? };
+            let stop_event = SharedHandle::new(unsafe {
+                CreateEventW(None, TRUE.into(), FALSE.into(), PCWSTR::null())?
+            });
             state.connection_handles = Some(ConnectedThreadHandles {
                 socket: sock,
                 read_thread_handle: None,
@@ -620,17 +649,17 @@ pub mod core {
     }
 
     pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
-        let state = BT_STATE
-            .lock()
-            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for get_connected_device_info"))?;
+        let state = BT_STATE.lock().map_err(|_| {
+            corelib::anyhow_site!("Failed to lock BT_STATE for get_connected_device_info")
+        })?;
         Ok(state.connected_device_info.clone())
     }
 
     pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
         let should_call_now = {
-            let state = BT_STATE
-                .lock()
-                .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (check)"))?;
+            let state = BT_STATE.lock().map_err(|_| {
+                corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (check)")
+            })?;
             state.connected_device_info.is_some()
         };
 
@@ -638,9 +667,9 @@ pub mod core {
             cb();
         }
 
-        let mut state = BT_STATE
-            .lock()
-            .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (store)"))?;
+        let mut state = BT_STATE.lock().map_err(|_| {
+            corelib::anyhow_site!("Failed to lock BT_STATE for on_connected (store)")
+        })?;
         state.on_connected_callback = Some(cb);
         Ok(())
     }
@@ -658,7 +687,9 @@ pub mod core {
     pub fn start_subscription_impl() -> Result<()> {
         let (sock_copy_opt, stop_event_for_thread_opt, can_start) = {
             let state_guard = BT_STATE.lock().map_err(|_| {
-                corelib::anyhow_site!("Failed to lock BT_STATE for start_subscription (initial check)")
+                corelib::anyhow_site!(
+                    "Failed to lock BT_STATE for start_subscription (initial check)"
+                )
             })?;
 
             if let Some(ref handles) = state_guard.connection_handles {
@@ -693,18 +724,19 @@ pub mod core {
             {
                 let state_clone_for_thread = Arc::clone(&BT_STATE);
                 handles.read_thread_handle = Some(thread::spawn(move || {
+                    let stop_event_handle = stop_event_for_thread.raw();
                     info!("Read thread started for socket {:?}", sock_copy);
                     let mut buffer = [0u8; 1024];
                     loop {
                         let bytes_received =
                             unsafe { recv(sock_copy, &mut buffer, SEND_RECV_FLAGS(0)) };
 
-                        let wait_result = unsafe { WaitForSingleObject(stop_event_for_thread, 0) };
+                        let wait_result = unsafe { WaitForSingleObject(stop_event_handle, 0) };
 
                         info!("Wait status: {:?}", wait_result);
 
                         if wait_result == WAIT_OBJECT_0 {
-                            unsafe { CloseHandle(stop_event_for_thread).ok() };
+                            unsafe { CloseHandle(stop_event_handle).ok() };
                             info!("Read thread received stop signal.");
                             break;
                         }
@@ -800,7 +832,9 @@ pub mod core {
                 if sent > 0 {
                     total_sent += sent as usize;
                 } else {
-                    corelib::bail_site!("send failed with error: {}", unsafe { WSAGetLastError().0 });
+                    corelib::bail_site!("send failed with error: {}", unsafe {
+                        WSAGetLastError().0
+                    });
                 }
             }
             Ok(())
@@ -815,7 +849,7 @@ pub mod core {
             if !handles.stop_event.is_invalid() {
                 info!("SetEvent stop_event");
                 unsafe {
-                    SetEvent(handles.stop_event).ok();
+                    SetEvent(handles.stop_event.raw()).ok();
                 }
             } else {
                 error!("stop_event is invalid");
