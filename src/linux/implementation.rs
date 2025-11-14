@@ -251,7 +251,9 @@ pub mod core {
                     }
                     Ok(true)
                 } else {
-                    Err(corelib::anyhow_site!("Failed to connect on all attempted channels"))
+                    Err(corelib::anyhow_site!(
+                        "Failed to connect on all attempted channels"
+                    ))
                 }
             })
         })

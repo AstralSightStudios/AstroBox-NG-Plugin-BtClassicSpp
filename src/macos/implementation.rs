@@ -333,7 +333,8 @@ pub mod core {
                     msg_send![IOBluetoothDevice::class(), deviceWithAddressString: Some(&*addr_ns)]
                 }
             };
-            let dev = dev_opt.ok_or_else(|| corelib::anyhow_site!("Device not found for {}", addr))?;
+            let dev =
+                dev_opt.ok_or_else(|| corelib::anyhow_site!("Device not found for {}", addr))?;
 
             unsafe {
                 let dev_ref: &IOBluetoothDevice = &*dev;
@@ -367,7 +368,9 @@ pub mod core {
                     /* 提前写入 pending device，保持原 Windows 语义 */
                     SHARED_BT_STATE
                         .lock()
-                        .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
+                        .map_err(|_| {
+                            corelib::anyhow_site!("Failed to acquire Bluetooth state lock")
+                        })?
                         .connected_device_info = Some(SPPDevice {
                         name: unsafe { dev.nameOrAddress() }.map(|s| s.to_string()),
                         address: addr.clone(),
@@ -430,10 +433,15 @@ pub mod core {
                     if ret == kIOReturnSuccess {
                         Ok(())
                     } else {
-                        Err(corelib::anyhow_site!("Failed to send data, error code: {}", ret))
+                        Err(corelib::anyhow_site!(
+                            "Failed to send data, error code: {}",
+                            ret
+                        ))
                     }
                 } else {
-                    Err(corelib::anyhow_site!("Device not connected, cannot send data"))
+                    Err(corelib::anyhow_site!(
+                        "Device not connected, cannot send data"
+                    ))
                 }
             })
         })
