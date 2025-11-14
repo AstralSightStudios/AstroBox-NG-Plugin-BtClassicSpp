@@ -9,7 +9,7 @@ exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
 links = "btclassic-spp"
 
 [dependencies]
-tauri = { version = "2.9.2" }
+tauri = { version = "2.9.2", features = ["rustls-tls"] }
 serde = "1.0"
 thiserror = "2"
 base64 = "0.22.1"
