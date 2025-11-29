@@ -109,6 +109,16 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                     0
                 )
             }
+            if (ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.ACCESS_FINE_LOCATION
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    context as Activity,
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                    0
+                )
+            }
 
             if (ContextCompat.checkSelfPermission(
                     context, Manifest.permission.BLUETOOTH_ADMIN
@@ -119,6 +129,18 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                     arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
                     0
                 )
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.NEARBY_WIFI_DEVICES
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    ActivityCompat.requestPermissions(
+                        context as Activity,
+                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
+                        0
+                    )
+                }
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -180,6 +202,16 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 0
             )
         }
+        if (ContextCompat.checkSelfPermission(
+                context, Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                context as Activity,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                0
+            )
+        }
 
         if (ContextCompat.checkSelfPermission(
                 context, Manifest.permission.BLUETOOTH_ADMIN
@@ -190,6 +222,18 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
                 0
             )
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.NEARBY_WIFI_DEVICES
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    context as Activity,
+                    arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
+                    0
+                )
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -287,6 +331,18 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 errMsg = "No ACCESS_COARSE_LOCATION permission"
                 return@withContext false to errMsg
             }
+            if (ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.ACCESS_FINE_LOCATION
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    context as Activity,
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                    0
+                )
+                errMsg = "No ACCESS_FINE_LOCATION permission"
+                return@withContext false to errMsg
+            }
 
             if (ContextCompat.checkSelfPermission(
                     context, Manifest.permission.BLUETOOTH_ADMIN
@@ -299,6 +355,20 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 )
                 errMsg = "No BLUETOOTH_ADMIN permission"
                 return@withContext false to errMsg
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                if (ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.NEARBY_WIFI_DEVICES
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    ActivityCompat.requestPermissions(
+                        context as Activity,
+                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
+                        0
+                    )
+                    errMsg = "No NEARBY_WIFI_DEVICES permission"
+                    return@withContext false to errMsg
+                }
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -436,6 +506,16 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 0
             )
         }
+        if (ContextCompat.checkSelfPermission(
+                context, Manifest.permission.ACCESS_FINE_LOCATION
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                context as Activity,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
+                0
+            )
+        }
 
         if (ContextCompat.checkSelfPermission(
                 context, Manifest.permission.BLUETOOTH_ADMIN
@@ -446,6 +526,18 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
                 0
             )
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.NEARBY_WIFI_DEVICES
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                ActivityCompat.requestPermissions(
+                    context as Activity,
+                    arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
+                    0
+                )
+            }
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
