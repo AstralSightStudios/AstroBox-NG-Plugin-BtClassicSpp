@@ -30,6 +30,10 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         this.webView = webView
     }
 
+    override fun onResume() {
+        implementation.onHostResume()
+    }
+
     /** ------------ 蓝牙扫描 ------------ **/
     @SuppressLint("MissingPermission")
     @Command

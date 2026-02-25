@@ -13,9 +13,11 @@ import android.content.Context.RECEIVER_EXPORTED
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.webkit.WebView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -36,23 +38,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     private val SPP_PREFIX = "00001101"
     private val MAX_PACKET_SIZE = 1004 // SPP理论最大值
-
-    /*
-    private val REQUIRED_PERMISSIONS_S = arrayOf(
-        Manifest.permission.BLUETOOTH,
-        Manifest.permission.BLUETOOTH_ADMIN,
-        Manifest.permission.BLUETOOTH_SCAN,
-        Manifest.permission.BLUETOOTH_CONNECT,
-        Manifest.permission.ACCESS_COARSE_LOCATION
-    )
-
-    private val REQUIRED_PERMISSIONS_OLD = arrayOf(
-        Manifest.permission.BLUETOOTH,
-        Manifest.permission.BLUETOOTH_ADMIN,
-        Manifest.permission.ACCESS_COARSE_LOCATION
-    )
     private val PERMISSION_REQUEST_CODE = 1001
-    */
+    private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
+    private val PRECISE_LOCATION_REQUIRED_MESSAGE =
+        "请授予AstroBox访问您的精确位置，否则将无法连接到任何蓝牙设备，此为安卓系统硬性要求。"
+    private val PRECISE_LOCATION_DIALOG_COOLDOWN_MS = 3000L
+    @Volatile private var lastPermissionRequestAtMs: Long = 0L
+    @Volatile private var lastPreciseLocationDialogAtMs: Long = 0L
+    @Volatile private var pendingStartupPermissionCheck: Boolean = false
 
     private val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private val scannedDevices = mutableListOf<BluetoothDevice>()
@@ -69,6 +62,114 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private var readThread: Thread? = null
     private val uiHandler = Handler(Looper.getMainLooper())
 
+    private fun requiredRuntimePermissions(): Array<String> {
+        return when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            )
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            )
+            else -> arrayOf(
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            )
+        }
+    }
+
+    private fun missingRuntimePermissions(activity: Activity): Array<String> {
+        return requiredRuntimePermissions()
+            .distinct()
+            .filter {
+                ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
+            }
+            .toTypedArray()
+    }
+
+    private fun hasPreciseLocationPermission(activity: Activity): Boolean {
+        return ContextCompat.checkSelfPermission(
+            activity,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun ensureRuntimePermissions(requestIfMissing: Boolean): Boolean {
+        val activity = context as? Activity
+            ?: throw IllegalStateException("需要传入 Activity 作为 context，才能申请运行时权限。")
+        val missing = missingRuntimePermissions(activity)
+        if (missing.isEmpty()) return true
+        if (!requestIfMissing) return false
+        val now = System.currentTimeMillis()
+        if (now - lastPermissionRequestAtMs < PERMISSION_REQUEST_COOLDOWN_MS) {
+            return false
+        }
+        lastPermissionRequestAtMs = now
+
+        val request = {
+            ActivityCompat.requestPermissions(activity, missing, PERMISSION_REQUEST_CODE)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            request()
+        } else {
+            uiHandler.post { request() }
+        }
+        return false
+    }
+
+    private fun showPreciseLocationRequiredDialogIfNeeded() {
+        val activity = context as? Activity ?: return
+        if (hasPreciseLocationPermission(activity)) return
+        val now = System.currentTimeMillis()
+        if (now - lastPreciseLocationDialogAtMs < PRECISE_LOCATION_DIALOG_COOLDOWN_MS) {
+            return
+        }
+        lastPreciseLocationDialogAtMs = now
+
+        val showDialog = {
+            android.app.AlertDialog.Builder(activity)
+                .setMessage(PRECISE_LOCATION_REQUIRED_MESSAGE)
+                .setCancelable(true)
+                .setPositiveButton("去设置") { _, _ ->
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", activity.packageName, null)
+                    }
+                    activity.startActivity(intent)
+                }
+                .setNegativeButton("稍后", null)
+                .show()
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            showDialog()
+        } else {
+            uiHandler.post { showDialog() }
+        }
+    }
+
+    fun onHostResume() {
+        if (!pendingStartupPermissionCheck) return
+        val now = System.currentTimeMillis()
+        if (now - lastPermissionRequestAtMs < PERMISSION_REQUEST_COOLDOWN_MS) {
+            return
+        }
+        pendingStartupPermissionCheck = false
+        val granted = ensureRuntimePermissions(requestIfMissing = false)
+        if (!granted) {
+            showPreciseLocationRequiredDialogIfNeeded()
+        }
+    }
+
+    private fun missingPermissionsMessage(): String {
+        val activity = context as? Activity ?: return PRECISE_LOCATION_REQUIRED_MESSAGE
+        if (!hasPreciseLocationPermission(activity)) {
+            return PRECISE_LOCATION_REQUIRED_MESSAGE
+        }
+        val missing = missingRuntimePermissions(activity)
+        if (missing.isEmpty()) return PRECISE_LOCATION_REQUIRED_MESSAGE
+        return "Missing permissions: ${missing.joinToString(", ")}"
+    }
+
     interface DataListener {
         fun onDataReceived(data: ByteArray)
         fun onError(e: IOException)
@@ -80,107 +181,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     fun getConnectedDeviceInfo(): BluetoothDevice? = connectedDevice
     fun setDataListener(listener: DataListener) { dataListener = listener }
 
-    @SuppressLint("MissingPermission")
     fun initPermissions() {
-        if (context is Activity) {
-            /*
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                ActivityCompat.requestPermissions(
-                    context,
-                    REQUIRED_PERMISSIONS_S,
-                    PERMISSION_REQUEST_CODE
-                )
-            } else {
-                ActivityCompat.requestPermissions(
-                    context,
-                    REQUIRED_PERMISSIONS_OLD,
-                    PERMISSION_REQUEST_CODE
-                )
-            }
-            */
-            /* 检查权限 */
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.ACCESS_COARSE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION),
-                    0
-                )
-            }
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
-                    0
-                )
-            }
-
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_ADMIN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
-                    0
-                )
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.NEARBY_WIFI_DEVICES
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
-                        0
-                    )
-                }
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH_SCAN
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH_SCAN),
-                        0
-                    )
-                }
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH_CONNECT
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
-                        0
-                    )
-                }
-            } else {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH),
-                        0
-                    )
-                }
-            }
-            /* 检查权限 */
-
-        } else {
-            throw IllegalStateException("需要传入 Activity 作为 context，才能申请运行时权限。哦我操你妈的傻逼安卓。")
-        }
+        pendingStartupPermissionCheck = !ensureRuntimePermissions(requestIfMissing = true)
     }
 
     private suspend fun webViewLog(content: String) {
@@ -191,85 +193,10 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     @SuppressLint("MissingPermission")
     fun startScan() {
-        /* 检查权限 */
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.ACCESS_COARSE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION),
-                0
-            )
+        if (!ensureRuntimePermissions(requestIfMissing = false)) {
+            showPreciseLocationRequiredDialogIfNeeded()
+            return
         }
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
-                0
-            )
-        }
-
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.BLUETOOTH_ADMIN
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
-                0
-            )
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.NEARBY_WIFI_DEVICES
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
-                    0
-                )
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_SCAN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_SCAN),
-                    0
-                )
-            }
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_CONNECT
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
-                    0
-                )
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH),
-                    0
-                )
-            }
-        }
-        /* 检查权限 */
         scannedDevices.clear()
         adapter?.let { bt ->
             if (bt.isDiscovering) bt.cancelDiscovery()
@@ -317,100 +244,11 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     ): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
         var errMsg: String?
         try {
-
-            /* 检查权限 */
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.ACCESS_COARSE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION),
-                    0
-                )
-                errMsg = "No ACCESS_COARSE_LOCATION permission"
+            if (!ensureRuntimePermissions(requestIfMissing = false)) {
+                showPreciseLocationRequiredDialogIfNeeded()
+                errMsg = missingPermissionsMessage()
                 return@withContext false to errMsg
             }
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
-                    0
-                )
-                errMsg = "No ACCESS_FINE_LOCATION permission"
-                return@withContext false to errMsg
-            }
-
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_ADMIN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
-                    0
-                )
-                errMsg = "No BLUETOOTH_ADMIN permission"
-                return@withContext false to errMsg
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.NEARBY_WIFI_DEVICES
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
-                        0
-                    )
-                    errMsg = "No NEARBY_WIFI_DEVICES permission"
-                    return@withContext false to errMsg
-                }
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH_SCAN
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH_SCAN),
-                        0
-                    )
-                    errMsg = "No BLUETOOTH_SCAN permission"
-                    return@withContext false to errMsg
-                }
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH_CONNECT
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
-                        0
-                    )
-                    errMsg = "No BLUETOOTH_CONNECT permission"
-                    return@withContext false to errMsg
-                }
-            } else {
-                if (ContextCompat.checkSelfPermission(
-                        context, Manifest.permission.BLUETOOTH
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    ActivityCompat.requestPermissions(
-                        context as Activity,
-                        arrayOf(Manifest.permission.BLUETOOTH),
-                        0
-                    )
-                    errMsg = "No BLUETOOTH permission"
-                    return@withContext false to errMsg
-                }
-            }
-            /* 检查权限 */
 
             val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
                 ?: return@withContext false to "BluetoothAdapter == null"
@@ -495,85 +333,10 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         context: Context,
         timeoutMs: Long = 15_000L
     ) {
-        /* 检查权限 */
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.ACCESS_COARSE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION),
-                0
-            )
+        if (!ensureRuntimePermissions(requestIfMissing = false)) {
+            showPreciseLocationRequiredDialogIfNeeded()
+            throw IOException(missingPermissionsMessage())
         }
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
-                0
-            )
-        }
-
-        if (ContextCompat.checkSelfPermission(
-                context, Manifest.permission.BLUETOOTH_ADMIN
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                context as Activity,
-                arrayOf(Manifest.permission.BLUETOOTH_ADMIN),
-                0
-            )
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.NEARBY_WIFI_DEVICES
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES),
-                    0
-                )
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_SCAN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_SCAN),
-                    0
-                )
-            }
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH_CONNECT
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH_CONNECT),
-                    0
-                )
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(
-                    context, Manifest.permission.BLUETOOTH
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                ActivityCompat.requestPermissions(
-                    context as Activity,
-                    arrayOf(Manifest.permission.BLUETOOTH),
-                    0
-                )
-            }
-        }
-        /* 检查权限 */
 
         if (bondState == BluetoothDevice.BOND_BONDED) return
 
