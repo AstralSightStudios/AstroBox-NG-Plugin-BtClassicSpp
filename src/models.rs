@@ -36,3 +36,9 @@ pub struct SetDataListenerResult {
 pub struct SPPSendPayload {
     pub b64data: String,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetMaxSendLenResult {
+    pub ret: Option<usize>,
+}

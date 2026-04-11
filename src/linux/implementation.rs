@@ -6,8 +6,8 @@ use bluer::rfcomm::{SocketAddr, Stream};
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session};
 use futures_util::stream::StreamExt;
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
@@ -262,6 +262,10 @@ pub mod core {
     pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
         let st = STATE.lock().unwrap();
         Ok(st.connected_device_info.clone())
+    }
+
+    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
+        Ok(None)
     }
 
     pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {

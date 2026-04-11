@@ -1,11 +1,11 @@
-use base64::{engine::general_purpose, Engine};
+use base64::{Engine, engine::general_purpose};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri::{
+    AppHandle, Runtime,
     ipc::{Channel, InvokeResponseBody},
     plugin::{PluginApi, PluginHandle},
-    AppHandle, Runtime,
 };
 
 use crate::models::*;
@@ -87,6 +87,14 @@ impl<R: Runtime> BtclassicSpp<R> {
         self.0
             .run_mobile_plugin("getConnectedDeviceInfo", ())
             .map_err(Into::into)
+    }
+
+    pub fn get_max_send_len(&self) -> anyhow::Result<Option<usize>> {
+        let ret: GetMaxSendLenResult = self
+            .0
+            .run_mobile_plugin("getMaxSendLen", ())
+            .map_err(anyhow::Error::from)?;
+        Ok(ret.ret)
     }
 
     /* ---------- 事件回调 ---------- */

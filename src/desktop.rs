@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use tauri::{plugin::PluginApi, AppHandle, Runtime};
+use tauri::{AppHandle, Runtime, plugin::PluginApi};
 
 #[cfg(target_os = "windows")]
 #[path = "./win/implementation.rs"]
@@ -48,6 +48,10 @@ impl<R: Runtime> BtclassicSpp<R> {
     pub fn get_connected_device_info(&self) -> anyhow::Result<SPPDevice> {
         core::get_connected_device_info_impl()?
             .ok_or_else(|| corelib::anyhow_site!("No device connected or info unavailable"))
+    }
+
+    pub fn get_max_send_len(&self) -> anyhow::Result<Option<usize>> {
+        core::get_max_send_len_impl()
     }
 
     pub fn on_connected<F>(&self, cb: F) -> anyhow::Result<()>

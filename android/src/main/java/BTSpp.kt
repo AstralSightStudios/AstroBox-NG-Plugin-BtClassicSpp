@@ -179,6 +179,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     fun getScannedDevices(): List<BluetoothDevice> = scannedDevices.toList()
     fun getConnectedDeviceInfo(): BluetoothDevice? = connectedDevice
+    fun getMaxSendLen(): Int? = if (connectedDevice != null) MAX_PACKET_SIZE else null
     fun setDataListener(listener: DataListener) { dataListener = listener }
 
     fun initPermissions() {

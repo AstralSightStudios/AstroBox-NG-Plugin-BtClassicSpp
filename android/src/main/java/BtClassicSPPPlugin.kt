@@ -107,6 +107,13 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
+    @Command
+    fun getMaxSendLen(invoke: Invoke) {
+        val ret = JSObject()
+        ret.put("ret", implementation.getMaxSendLen())
+        invoke.resolve(ret)
+    }
+
     /** ------------ 数据监听 ------------ **/
     @Command
     fun setDataListener(invoke: Invoke) {

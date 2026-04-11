@@ -1,12 +1,8 @@
-use std::cell::RefCell;
-use std::ffi::c_void;
-use std::sync::{mpsc, Arc, Mutex};
-
 use anyhow::Result;
 use dispatch::Queue;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
-use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{ClassType, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send};
 use objc2_foundation::{NSObject, NSString};
 use objc2_io_bluetooth::{
     BluetoothRFCOMMChannelID, IOBluetoothDevice, IOBluetoothDeviceInquiry,
@@ -14,6 +10,9 @@ use objc2_io_bluetooth::{
 };
 use objc2_io_kit::kIOReturnSuccess;
 use once_cell::sync::Lazy;
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::models::SPPDevice;
 
@@ -394,6 +393,19 @@ pub mod core {
             .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .connected_device_info
             .clone())
+    }
+
+    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
+        run_on_main_thread(|_| {
+            MAIN_THREAD_STATE.with(|cell| {
+                let state = cell.borrow();
+                let Some(chan) = state.rfcomm_channel.as_ref() else {
+                    return Ok(None);
+                };
+                let mtu = unsafe { chan.getMTU() } as usize;
+                Ok(Some(mtu.max(1)))
+            })
+        })
     }
 
     /* ---- 回调设置 ---- */

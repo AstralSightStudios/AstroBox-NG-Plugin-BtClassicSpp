@@ -44,6 +44,10 @@ class ExamplePlugin: Plugin {
     @objc public func getConnectedDeviceInfo(_ invoke: Invoke) throws {
         try throwUnsupportedSystemError()
     }
+
+    @objc public func getMaxSendLen(_ invoke: Invoke) throws {
+        try throwUnsupportedSystemError()
+    }
     
     @objc public func onConnected(_ invoke: Invoke) throws {
         try throwUnsupportedSystemError()

@@ -1,28 +1,29 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 
-use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::Bluetooth::{
+    AF_BTH, BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
     BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
     BluetoothFindFirstRadio, BluetoothFindNextDevice, BluetoothFindRadioClose,
-    BluetoothGetDeviceInfo, MITMProtectionNotRequired, AF_BTH, BLUETOOTH_DEVICE_INFO,
-    BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS, HBLUETOOTH_DEVICE_FIND,
-    HBLUETOOTH_RADIO_FIND, SOCKADDR_BTH,
+    BluetoothGetDeviceInfo, HBLUETOOTH_DEVICE_FIND, HBLUETOOTH_RADIO_FIND,
+    MITMProtectionNotRequired, SOCKADDR_BTH,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, HANDLE, TRUE,
+    CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, GetLastError, HANDLE, TRUE,
     WAIT_OBJECT_0,
 };
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, recv, send, shutdown, socket, WSACleanup, WSAGetLastError, WSAStartup,
-    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCKET, SOCK_STREAM, WSADATA, WSAEWOULDBLOCK,
+    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCK_STREAM, SOCKET, WSACleanup, WSADATA,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, closesocket, connect, recv, send, shutdown,
+    socket,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::core::{GUID, PCWSTR};
 
 use crate::SPPDevice;
 
@@ -270,7 +271,11 @@ pub mod core {
                 let find_handle: HBLUETOOTH_DEVICE_FIND = match find_handle_result {
                     Ok(h) if !h.is_invalid() => h,
                     Ok(invalid_h) => {
-                        error!("Continuous scan: BluetoothFindFirstDevice returned Ok with an invalid handle: {:?}. Win32 Error: {:?}. Pausing before retry.", invalid_h, unsafe { GetLastError() });
+                        error!(
+                            "Continuous scan: BluetoothFindFirstDevice returned Ok with an invalid handle: {:?}. Win32 Error: {:?}. Pausing before retry.",
+                            invalid_h,
+                            unsafe { GetLastError() }
+                        );
                         let pause_wait = unsafe {
                             WaitForSingleObject(stop_event_handle, INQUIRY_CYCLE_PAUSE_MS)
                         };
@@ -280,7 +285,11 @@ pub mod core {
                         continue 'outer_scan_loop;
                     }
                     Err(e) => {
-                        error!("Continuous scan: BluetoothFindFirstDevice failed. Error: {:?} (Win32: {:?}). Pausing before retry.", e, unsafe { GetLastError() });
+                        error!(
+                            "Continuous scan: BluetoothFindFirstDevice failed. Error: {:?} (Win32: {:?}). Pausing before retry.",
+                            e,
+                            unsafe { GetLastError() }
+                        );
                         let pause_wait = unsafe {
                             WaitForSingleObject(stop_event_handle, INQUIRY_CYCLE_PAUSE_MS)
                         };
@@ -341,7 +350,10 @@ pub mod core {
                             });
                             debug!(
                                 "Continuous scan found next: Name: '{}', Address: {}, Paired: {}, Connected: {}",
-                                name_str, address_str, device_info.fAuthenticated == TRUE, device_info.fConnected == TRUE
+                                name_str,
+                                address_str,
+                                device_info.fAuthenticated == TRUE,
+                                device_info.fConnected == TRUE
                             );
                             let dev = SPPDevice {
                                 name: Some(name_str),
@@ -358,9 +370,15 @@ pub mod core {
                         }
                         Err(e) => {
                             if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() {
-                                debug!("Continuous scan: BluetoothFindNextDevice: No more items in this cycle.");
+                                debug!(
+                                    "Continuous scan: BluetoothFindNextDevice: No more items in this cycle."
+                                );
                             } else {
-                                error!("Continuous scan: BluetoothFindNextDevice error: {:?} (Win32: {:?})", e, unsafe { GetLastError() });
+                                error!(
+                                    "Continuous scan: BluetoothFindNextDevice error: {:?} (Win32: {:?})",
+                                    e,
+                                    unsafe { GetLastError() }
+                                );
                             }
                             break 'inner_device_loop;
                         }
@@ -587,12 +605,22 @@ pub mod core {
             };
 
             if auth_result == ERROR_SUCCESS.0 {
-                info!("BluetoothAuthenticateDeviceEx call returned ERROR_SUCCESS for {}. Device should now be authenticated (paired). fAuthenticated flag is: {}", addr_str, device_info_struct.fAuthenticated == TRUE);
+                info!(
+                    "BluetoothAuthenticateDeviceEx call returned ERROR_SUCCESS for {}. Device should now be authenticated (paired). fAuthenticated flag is: {}",
+                    addr_str,
+                    device_info_struct.fAuthenticated == TRUE
+                );
                 if device_info_struct.fAuthenticated != TRUE {
-                    warn!("Device {} pairing initiated by BluetoothAuthenticateDeviceEx, but fAuthenticated is still false. Pairing might be in progress or require further action.", addr_str);
+                    warn!(
+                        "Device {} pairing initiated by BluetoothAuthenticateDeviceEx, but fAuthenticated is still false. Pairing might be in progress or require further action.",
+                        addr_str
+                    );
                 }
             } else {
-                warn!("BluetoothAuthenticateDeviceEx call failed for {}. Error code: {}. Pairing may require user interaction or failed. Connection attempt will proceed.", addr_str, auth_result);
+                warn!(
+                    "BluetoothAuthenticateDeviceEx call failed for {}. Error code: {}. Pairing may require user interaction or failed. Connection attempt will proceed.",
+                    addr_str, auth_result
+                );
             }
         }
         if !radio_handle.is_invalid() {
@@ -653,6 +681,10 @@ pub mod core {
             corelib::anyhow_site!("Failed to lock BT_STATE for get_connected_device_info")
         })?;
         Ok(state.connected_device_info.clone())
+    }
+
+    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
+        Ok(None)
     }
 
     pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
@@ -815,7 +847,9 @@ pub mod core {
                 info!("Subscription started successfully.");
             }
             _ => {
-                warn!("Could not start subscription, state might have changed or connection is different.");
+                warn!(
+                    "Could not start subscription, state might have changed or connection is different."
+                );
             }
         }
         Ok(())
@@ -827,7 +861,9 @@ pub mod core {
             .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for send"))?;
         if let Some(ref handles) = state.connection_handles {
             let mut total_sent = 0;
+            let mut send_calls = 0usize;
             while total_sent < data.len() {
+                send_calls += 1;
                 let sent = unsafe { send(handles.socket, &data[total_sent..], SEND_RECV_FLAGS(0)) };
                 if sent > 0 {
                     total_sent += sent as usize;
