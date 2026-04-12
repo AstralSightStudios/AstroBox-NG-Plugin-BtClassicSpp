@@ -6,24 +6,23 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 
+use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::Bluetooth::{
-    AF_BTH, BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
     BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
     BluetoothFindFirstRadio, BluetoothFindNextDevice, BluetoothFindRadioClose,
-    BluetoothGetDeviceInfo, HBLUETOOTH_DEVICE_FIND, HBLUETOOTH_RADIO_FIND,
-    MITMProtectionNotRequired, SOCKADDR_BTH,
+    BluetoothGetDeviceInfo, MITMProtectionNotRequired, AF_BTH, BLUETOOTH_DEVICE_INFO,
+    BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS, HBLUETOOTH_DEVICE_FIND,
+    HBLUETOOTH_RADIO_FIND, SOCKADDR_BTH,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, GetLastError, HANDLE, TRUE,
+    CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, HANDLE, TRUE,
     WAIT_OBJECT_0,
 };
 use windows::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCK_STREAM, SOCKET, WSACleanup, WSADATA,
-    WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, closesocket, connect, recv, send, shutdown,
-    socket,
+    closesocket, connect, recv, send, shutdown, socket, WSACleanup, WSAGetLastError, WSAStartup,
+    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCKET, SOCK_STREAM, WSADATA, WSAEWOULDBLOCK,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
-use windows::core::{GUID, PCWSTR};
 
 use crate::SPPDevice;
 

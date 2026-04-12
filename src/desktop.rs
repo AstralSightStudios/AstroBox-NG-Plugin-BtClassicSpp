@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use tauri::{AppHandle, Runtime, plugin::PluginApi};
+use tauri::{plugin::PluginApi, AppHandle, Runtime};
 
 #[cfg(target_os = "windows")]
 #[path = "./win/implementation.rs"]

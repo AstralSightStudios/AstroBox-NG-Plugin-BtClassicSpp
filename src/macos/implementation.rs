@@ -2,7 +2,7 @@ use anyhow::Result;
 use dispatch::Queue;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send};
+use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly, Message};
 use objc2_foundation::{NSObject, NSString};
 use objc2_io_bluetooth::{
     BluetoothRFCOMMChannelID, IOBluetoothDevice, IOBluetoothDeviceInquiry,
@@ -12,7 +12,7 @@ use objc2_io_kit::kIOReturnSuccess;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::models::SPPDevice;
 
