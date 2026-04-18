@@ -31,13 +31,12 @@ import java.io.OutputStream
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlin.math.min
 
 @OptIn(ObsoleteCoroutinesApi::class)
 class BTSpp(private val context: Context, private val webView: WebView) {
 
     private val SPP_PREFIX = "00001101"
-    private val MAX_PACKET_SIZE = 1004 // SPP理论最大值
+    private val STREAM_WRITE_HINT = 60 * 1024
     private val PERMISSION_REQUEST_CODE = 1001
     private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
     private val PRECISE_LOCATION_REQUIRED_MESSAGE =
@@ -179,7 +178,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     fun getScannedDevices(): List<BluetoothDevice> = scannedDevices.toList()
     fun getConnectedDeviceInfo(): BluetoothDevice? = connectedDevice
-    fun getMaxSendLen(): Int? = if (connectedDevice != null) MAX_PACKET_SIZE else null
+    fun getMaxSendLen(): Int? = if (connectedDevice != null) STREAM_WRITE_HINT else null
     fun setDataListener(listener: DataListener) { dataListener = listener }
 
     fun initPermissions() {
@@ -291,12 +290,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             sendActor = sendScope.actor(capacity = Channel.UNLIMITED) {
                 for (payload in channel) {
                     try {
-                        var offset = 0
-                        while (offset < payload.size) {
-                            val len = min(MAX_PACKET_SIZE, payload.size - offset)
-                            outStream?.write(payload, offset, len)
-                            offset += len
-                        }
+                        outStream?.write(payload)
                         outStream?.flush()
                     } catch (e: IOException) {
                         uiHandler.post { dataListener?.onError(e) }

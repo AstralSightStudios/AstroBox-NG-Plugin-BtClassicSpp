@@ -79,8 +79,8 @@ struct MainThreadState {
 static SHARED_BT_STATE: Lazy<Arc<Mutex<SharedState>>> =
     Lazy::new(|| Arc::new(Mutex::new(SharedState::new())));
 
-const RFCOMM_ASYNC_MAX_IN_FLIGHT: usize = 24;
 const RFCOMM_ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(45);
+const RFCOMM_ASYNC_MAX_IN_FLIGHT: usize = 24;
 const KIORETURN_BUSY: i32 = 0xE00002D5u32 as i32;
 const KIORETURN_NOSPACE: i32 = 0xE00002DBu32 as i32;
 const KIORETURN_UNDERRUN: i32 = 0xE00002E7u32 as i32;
@@ -139,14 +139,14 @@ fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
                 return Action::Noop;
             };
 
+            if pending.in_flight >= RFCOMM_ASYNC_MAX_IN_FLIGHT {
+                return Action::Wait;
+            }
+
             if pending.next_chunk_idx >= pending.chunks.len() {
                 if pending.in_flight == 0 {
                     return Action::Complete;
                 }
-                return Action::Wait;
-            }
-
-            if pending.in_flight >= RFCOMM_ASYNC_MAX_IN_FLIGHT {
                 return Action::Wait;
             }
 
