@@ -13,6 +13,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use crate::models::SPPDevice;
 
@@ -72,14 +73,128 @@ struct MainThreadState {
     inquiry: Option<Retained<IOBluetoothDeviceInquiry>>,
     delegate: Option<Retained<BTDelegate>>,
     rfcomm_channel: Option<Retained<IOBluetoothRFCOMMChannel>>,
+    pending_send: Option<PendingRfcommSend>,
 }
 
 static SHARED_BT_STATE: Lazy<Arc<Mutex<SharedState>>> =
     Lazy::new(|| Arc::new(Mutex::new(SharedState::new())));
 
+const RFCOMM_ASYNC_MAX_IN_FLIGHT: usize = 24;
+const RFCOMM_ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(45);
+const KIORETURN_BUSY: i32 = 0xE00002D5u32 as i32;
+const KIORETURN_NOSPACE: i32 = 0xE00002DBu32 as i32;
+const KIORETURN_UNDERRUN: i32 = 0xE00002E7u32 as i32;
+const KIORETURN_OVERRUN: i32 = 0xE00002E8u32 as i32;
+
+struct PendingRfcommSend {
+    chunks: Vec<Vec<u8>>,
+    next_chunk_idx: usize,
+    in_flight: usize,
+    completion_tx: Option<mpsc::Sender<Result<()>>>,
+}
+
 thread_local! {
     static MAIN_THREAD_STATE: RefCell<MainThreadState> =
         RefCell::new(MainThreadState::default());
+}
+
+fn is_retryable_rfcomm_backpressure(status: i32) -> bool {
+    matches!(
+        status,
+        KIORETURN_BUSY | KIORETURN_NOSPACE | KIORETURN_UNDERRUN | KIORETURN_OVERRUN
+    )
+}
+
+fn complete_pending_rfcomm_send(result: Result<()>) {
+    let tx = MAIN_THREAD_STATE.with(|cell| {
+        cell.borrow_mut()
+            .pending_send
+            .take()
+            .and_then(|mut pending| pending.completion_tx.take())
+    });
+    if let Some(tx) = tx {
+        let _ = tx.send(result);
+    }
+}
+
+fn cancel_pending_rfcomm_send() {
+    MAIN_THREAD_STATE.with(|cell| {
+        cell.borrow_mut().pending_send = None;
+    });
+}
+
+fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
+    loop {
+        enum Action {
+            Continue,
+            Wait,
+            Complete,
+            Fail(String),
+            Noop,
+        }
+
+        let action = MAIN_THREAD_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let Some(pending) = state.pending_send.as_mut() else {
+                return Action::Noop;
+            };
+
+            if pending.next_chunk_idx >= pending.chunks.len() {
+                if pending.in_flight == 0 {
+                    return Action::Complete;
+                }
+                return Action::Wait;
+            }
+
+            if pending.in_flight >= RFCOMM_ASYNC_MAX_IN_FLIGHT {
+                return Action::Wait;
+            }
+
+            if unsafe { chan.isTransmissionPaused() } {
+                return Action::Wait;
+            }
+
+            let chunk = &pending.chunks[pending.next_chunk_idx];
+            let ret = unsafe {
+                chan.writeAsync_length_refcon(
+                    chunk.as_ptr() as *mut c_void,
+                    chunk.len() as u16,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if ret == kIOReturnSuccess {
+                pending.next_chunk_idx += 1;
+                pending.in_flight += 1;
+                Action::Continue
+            } else if is_retryable_rfcomm_backpressure(ret) {
+                Action::Wait
+            } else {
+                let mtu = unsafe { chan.getMTU() as usize }.max(1);
+                Action::Fail(format!(
+                    "Failed to queue data via write_async, error code: {}, next_chunk_len={}, mtu={}, next_chunk_idx={}, total_chunks={}",
+                    ret,
+                    chunk.len(),
+                    mtu,
+                    pending.next_chunk_idx,
+                    pending.chunks.len()
+                ))
+            }
+        });
+
+        match action {
+            Action::Continue => continue,
+            Action::Wait | Action::Noop => break,
+            Action::Complete => {
+                complete_pending_rfcomm_send(Ok(()));
+                break;
+            }
+            Action::Fail(err) => {
+                complete_pending_rfcomm_send(Err(corelib::anyhow_site!("{}", err)));
+                break;
+            }
+        }
+    }
 }
 
 /* ---------- Objective-C delegate ---------- */
@@ -196,6 +311,9 @@ define_class! {
             }
 
             MAIN_THREAD_STATE.with(|c| c.borrow_mut().rfcomm_channel = None);
+            complete_pending_rfcomm_send(Err(corelib::anyhow_site!(
+                "Connection closed during RFCOMM send"
+            )));
             if let Ok(mut st) = SHARED_BT_STATE.lock() {
                 st.connected_device_info = None;
                 if let Some(cb) = st.data_listener_callback.as_mut() {
@@ -205,6 +323,43 @@ define_class! {
 
             log::info!("Device disconnected. cleaning up bluetooth resources...");
             cleanup_bluetooth_resources();
+        }
+
+        #[unsafe(method(rfcommChannelWriteComplete:refcon:status:))]
+        fn rfcomm_channel_write_complete_refcon_status(
+            &self,
+            chan: &IOBluetoothRFCOMMChannel,
+            _refcon: *mut c_void,
+            status: i32,
+        ) {
+            if status != kIOReturnSuccess {
+                complete_pending_rfcomm_send(Err(corelib::anyhow_site!(
+                    "RFCOMM async write failed with status {}",
+                    status
+                )));
+                return;
+            }
+
+            MAIN_THREAD_STATE.with(|cell| {
+                let mut state = cell.borrow_mut();
+                if let Some(pending) = state.pending_send.as_mut() {
+                    pending.in_flight = pending.in_flight.saturating_sub(1);
+                }
+            });
+
+            pump_pending_rfcomm_send(chan);
+        }
+
+        #[unsafe(method(rfcommChannelQueueSpaceAvailable:))]
+        fn rfcomm_channel_queue_space_available(&self, chan: &IOBluetoothRFCOMMChannel) {
+            pump_pending_rfcomm_send(chan);
+        }
+
+        #[unsafe(method(rfcommChannelFlowControlChanged:))]
+        fn rfcomm_channel_flow_control_changed(&self, chan: &IOBluetoothRFCOMMChannel) {
+            if !unsafe { chan.isTransmissionPaused() } {
+                pump_pending_rfcomm_send(chan);
+            }
         }
     }
 }
@@ -435,38 +590,61 @@ pub mod core {
 
     /* ---- 数据发送 & 断开 ---- */
     pub fn send_impl(data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
         let payload = data.to_vec();
+        let (tx, rx) = mpsc::channel();
+
         run_on_main_thread(move |_mtm| {
-            MAIN_THREAD_STATE.with(|cell| {
-                if let Some(ref chan) = cell.borrow().rfcomm_channel {
-                    let mtu = unsafe { chan.getMTU() as usize }.max(1);
-                    let mut offset = 0usize;
-                    while offset < payload.len() {
-                        let chunk_len = (payload.len() - offset).min(mtu);
-                        let chunk = &payload[offset..offset + chunk_len];
-                        let ret = unsafe {
-                            chan.writeSync_length(chunk.as_ptr() as *mut c_void, chunk.len() as u16)
-                        };
-                        if ret != kIOReturnSuccess {
-                            return Err(corelib::anyhow_site!(
-                                "Failed to send data via write_sync, error code: {}, chunk_len={}, mtu={}, offset={}, total_len={}",
-                                ret,
-                                chunk.len(),
-                                mtu,
-                                offset,
-                                payload.len()
-                            ));
-                        }
-                        offset += chunk_len;
-                    }
-                    Ok(())
-                } else {
-                    Err(corelib::anyhow_site!(
-                        "Device not connected, cannot send data"
-                    ))
+            let chan = MAIN_THREAD_STATE.with(|cell| {
+                let mut state = cell.borrow_mut();
+                let Some(chan) = state.rfcomm_channel.clone() else {
+                    return Err(corelib::anyhow_site!("Device not connected, cannot send data"));
+                };
+                if state.pending_send.is_some() {
+                    return Err(corelib::anyhow_site!("RFCOMM send already in progress"));
                 }
-            })
-        })
+
+                let mtu = unsafe { chan.getMTU() as usize }.max(1);
+                let chunks = payload
+                    .chunks(mtu)
+                    .map(|chunk| chunk.to_vec())
+                    .collect::<Vec<_>>();
+
+                state.pending_send = Some(PendingRfcommSend {
+                    chunks,
+                    next_chunk_idx: 0,
+                    in_flight: 0,
+                    completion_tx: Some(tx),
+                });
+                Ok(chan)
+            })?;
+
+            pump_pending_rfcomm_send(&chan);
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        match rx.recv_timeout(RFCOMM_ASYNC_SEND_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                run_on_main_thread(|_| {
+                    cancel_pending_rfcomm_send();
+                });
+                Err(corelib::anyhow_site!(
+                    "RFCOMM async send timed out after {:?}",
+                    RFCOMM_ASYNC_SEND_TIMEOUT
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                run_on_main_thread(|_| {
+                    cancel_pending_rfcomm_send();
+                });
+                Err(corelib::anyhow_site!(
+                    "RFCOMM async send completion channel disconnected"
+                ))
+            }
+        }
     }
 
     pub fn disconnect_impl() -> Result<()> {
