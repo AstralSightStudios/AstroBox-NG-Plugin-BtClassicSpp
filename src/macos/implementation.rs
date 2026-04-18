@@ -439,17 +439,27 @@ pub mod core {
         run_on_main_thread(move |_mtm| {
             MAIN_THREAD_STATE.with(|cell| {
                 if let Some(ref chan) = cell.borrow().rfcomm_channel {
-                    let ret: i32 = unsafe {
-                        chan.writeSync_length(payload.as_ptr() as *mut c_void, payload.len() as u16)
-                    };
-                    if ret == kIOReturnSuccess {
-                        Ok(())
-                    } else {
-                        Err(corelib::anyhow_site!(
-                            "Failed to send data, error code: {}",
-                            ret
-                        ))
+                    let mtu = unsafe { chan.getMTU() as usize }.max(1);
+                    let mut offset = 0usize;
+                    while offset < payload.len() {
+                        let chunk_len = (payload.len() - offset).min(mtu);
+                        let chunk = &payload[offset..offset + chunk_len];
+                        let ret = unsafe {
+                            chan.writeSync_length(chunk.as_ptr() as *mut c_void, chunk.len() as u16)
+                        };
+                        if ret != kIOReturnSuccess {
+                            return Err(corelib::anyhow_site!(
+                                "Failed to send data via write_sync, error code: {}, chunk_len={}, mtu={}, offset={}, total_len={}",
+                                ret,
+                                chunk.len(),
+                                mtu,
+                                offset,
+                                payload.len()
+                            ));
+                        }
+                        offset += chunk_len;
                     }
+                    Ok(())
                 } else {
                     Err(corelib::anyhow_site!(
                         "Device not connected, cannot send data"
