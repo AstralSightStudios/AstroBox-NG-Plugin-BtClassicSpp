@@ -600,7 +600,9 @@ pub mod core {
             let chan = MAIN_THREAD_STATE.with(|cell| {
                 let mut state = cell.borrow_mut();
                 let Some(chan) = state.rfcomm_channel.clone() else {
-                    return Err(corelib::anyhow_site!("Device not connected, cannot send data"));
+                    return Err(corelib::anyhow_site!(
+                        "Device not connected, cannot send data"
+                    ));
                 };
                 if state.pending_send.is_some() {
                     return Err(corelib::anyhow_site!("RFCOMM send already in progress"));
