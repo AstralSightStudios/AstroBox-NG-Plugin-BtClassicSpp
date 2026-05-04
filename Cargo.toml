@@ -9,7 +9,7 @@ exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
 links = "btclassic-spp"
 
 [dependencies]
-tauri = { version = "2.9.2", features = ["rustls-tls"] }
+tauri = { version = "2.11.0", features = ["rustls-tls"] }
 serde = "1.0"
 thiserror = "2"
 base64 = "0.22.1"
@@ -51,4 +51,4 @@ windows = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
-tauri-plugin = { version = "2.5.1", features = ["build"] }
+tauri-plugin = { version = "2.6.0", features = ["build"] }
