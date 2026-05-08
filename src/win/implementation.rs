@@ -626,20 +626,20 @@ pub mod core {
             unsafe { CloseHandle(radio_handle).ok() };
         }
 
-        let sock = attempt_connect(target_bth_addr, None, Some(5))
+        let sock = attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None)
+            .or_else(|e| {
+                warn!(
+                    "SPP Service UUID failed for {}: {:?}. Trying RFCOMM channel 5...",
+                    addr_str, e
+                );
+                attempt_connect(target_bth_addr, None, Some(5))
+            })
             .or_else(|e| {
                 warn!(
                     "RFCOMM Channel 5 failed for {}: {:?}. Trying channel 1...",
                     addr_str, e
                 );
                 attempt_connect(target_bth_addr, None, Some(1))
-            })
-            .or_else(|e| {
-                warn!(
-                    "RFCOMM Channel 1 failed for {}: {:?}. Trying SPP Service UUID...",
-                    addr_str, e
-                );
-                attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None)
             })?;
         info!("SPP Connection successful to {}", addr_str);
 

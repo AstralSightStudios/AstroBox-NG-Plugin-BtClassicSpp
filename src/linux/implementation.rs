@@ -2,8 +2,8 @@
 
 use crate::models::SPPDevice;
 use anyhow::Result;
-use bluer::rfcomm::{SocketAddr, Stream};
-use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session};
+use bluer::rfcomm::{Profile, ReqError, Role, SocketAddr, Stream};
+use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session, Uuid};
 use futures_util::stream::StreamExt;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,8 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
         .build()
         .unwrap()
 });
+
+const SPP_SERVICE_UUID: &str = "00001101-0000-1000-8000-00805f9b34fb";
 
 struct GlobalState {
     adapter: Option<Adapter>,
@@ -88,6 +90,62 @@ pub fn init_bluetooth_stack() {
     log::info!("Initializing Linux Bluetooth stack...");
     Lazy::force(&STATE);
     log::info!("Linux Bluetooth stack initialized.");
+}
+
+async fn connect_spp_uuid(addr: Address) -> Result<Stream> {
+    let uuid = SPP_SERVICE_UUID
+        .parse::<Uuid>()
+        .map_err(|err| corelib::anyhow_site!("Invalid SPP UUID: {}", err))?;
+    let session = Session::new()
+        .await
+        .map_err(|err| corelib::anyhow_site!("Failed to create bluer session: {}", err))?;
+    let adapter = session
+        .default_adapter()
+        .await
+        .map_err(|err| corelib::anyhow_site!("Failed to get default adapter: {}", err))?;
+    let device = adapter
+        .device(addr)
+        .map_err(|err| corelib::anyhow_site!("Failed to open device {}: {}", addr, err))?;
+    let mut profile_handle = session
+        .register_profile(Profile {
+            uuid,
+            name: Some("AstroBox SPP Client".to_string()),
+            role: Some(Role::Client),
+            require_authentication: Some(false),
+            require_authorization: Some(false),
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| corelib::anyhow_site!("Failed to register SPP profile: {}", err))?;
+
+    let request_future = async move {
+        while let Some(request) = profile_handle.next().await {
+            if request.device() == addr {
+                return request.accept().map_err(|err| {
+                    corelib::anyhow_site!("Failed to accept SPP profile fd: {}", err)
+                });
+            }
+            request.reject(ReqError::Rejected);
+        }
+        Err(corelib::anyhow_site!(
+            "SPP profile closed before receiving an RFCOMM fd"
+        ))
+    };
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            connect_result = device.connect_profile(&uuid) => {
+                connect_result
+                    .map_err(|err| corelib::anyhow_site!("BlueZ ConnectProfile failed: {}", err))?;
+                Err(corelib::anyhow_site!(
+                    "BlueZ ConnectProfile completed without providing an RFCOMM fd"
+                ))
+            }
+            stream_result = request_future => stream_result,
+        }
+    })
+    .await
+    .map_err(|_| corelib::anyhow_site!("Timeout connecting through SPP Service UUID"))?
 }
 
 pub mod core {
@@ -210,22 +268,53 @@ pub mod core {
                     .parse()
                     .map_err(|e| corelib::anyhow_site!("Invalid address format: {}", e))?;
 
-                let channels_to_try = [5, 1];
                 let mut stream: Option<Stream> = None;
+                let mut last_error: Option<anyhow::Error> = None;
 
-                for &channel in &channels_to_try {
-                    let sock_addr = SocketAddr::new(addr, channel);
-                    log::info!("Attempting to connect to {} on channel {}", addr, channel);
-                    match tokio::time::timeout(Duration::from_secs(10), Stream::connect(sock_addr))
+                log::info!(
+                    "Attempting to connect to {} via SPP Service UUID {}",
+                    addr,
+                    SPP_SERVICE_UUID
+                );
+                match connect_spp_uuid(addr).await {
+                    Ok(s) => {
+                        log::info!("Successfully connected through SPP Service UUID");
+                        stream = Some(s);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to connect through SPP Service UUID: {}", e);
+                        last_error = Some(e);
+                    }
+                }
+
+                if stream.is_none() {
+                    let channels_to_try = [5, 1];
+                    for &channel in &channels_to_try {
+                        let sock_addr = SocketAddr::new(addr, channel);
+                        log::info!("Attempting to connect to {} on channel {}", addr, channel);
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            Stream::connect(sock_addr),
+                        )
                         .await
-                    {
-                        Ok(Ok(s)) => {
-                            log::info!("Successfully connected on channel {}", channel);
-                            stream = Some(s);
-                            break;
+                        {
+                            Ok(Ok(s)) => {
+                                log::info!("Successfully connected on channel {}", channel);
+                                stream = Some(s);
+                                break;
+                            }
+                            Ok(Err(e)) => {
+                                log::warn!("Failed to connect on channel {}: {}", channel, e);
+                                last_error = Some(e.into());
+                            }
+                            Err(_) => {
+                                log::warn!("Timeout connecting on channel {}", channel);
+                                last_error = Some(corelib::anyhow_site!(
+                                    "Timeout connecting on channel {}",
+                                    channel
+                                ));
+                            }
                         }
-                        Ok(Err(e)) => log::warn!("Failed to connect on channel {}: {}", channel, e),
-                        Err(_) => log::warn!("Timeout connecting on channel {}", channel),
                     }
                 }
 
@@ -252,7 +341,8 @@ pub mod core {
                     Ok(true)
                 } else {
                     Err(corelib::anyhow_site!(
-                        "Failed to connect on all attempted channels"
+                        "Failed to connect through SPP UUID or fallback channels: {:?}",
+                        last_error
                     ))
                 }
             })

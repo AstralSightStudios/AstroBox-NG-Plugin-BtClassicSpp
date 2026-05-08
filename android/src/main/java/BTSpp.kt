@@ -276,10 +276,9 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 }
             }
 
-            // 不知道为什么傻逼小米不让走SPP UUID配对，挨个试
-            val sock = tryChannel(dev, 5, 3_000)
+            val sock = trySdpUuid(dev)
+                ?: tryChannel(dev, 5, 3_000)
                 ?: tryChannel(dev, 1, 2_000)
-                ?: trySdpUuid(dev)
                 ?: return@withContext false to "No SPP channel/UUID available"
 
             socket = sock
