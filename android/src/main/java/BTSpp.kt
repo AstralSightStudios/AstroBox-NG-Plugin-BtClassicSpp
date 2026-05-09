@@ -240,7 +240,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     suspend fun connect(
         context: Context,
         address: String,
-        remove_bond: Boolean
+        remove_bond: Boolean,
+        fallbackChannels: List<Int> = emptyList()
     ): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
         var errMsg: String?
         try {
@@ -276,14 +277,19 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 }
             }
 
-            val sock = trySdpUuid(dev)
-                ?: tryChannel(dev, 5, 3_000)
-                ?: tryChannel(dev, 1, 2_000)
-                ?: return@withContext false to "No SPP channel/UUID available"
+            var sock = trySdpUuid(dev)
+            if (sock == null) {
+                val channels = fallbackChannels.ifEmpty { listOf(5, 1) }.distinct()
+                for (channel in channels) {
+                    sock = tryChannel(dev, channel, if (channel == 5) 3_000 else 2_000)
+                    if (sock != null) break
+                }
+            }
+            val connectedSock = sock ?: return@withContext false to "No SPP channel/UUID available"
 
-            socket = sock
-            inStream = sock.inputStream
-            outStream = sock.outputStream
+            socket = connectedSock
+            inStream = connectedSock.inputStream
+            outStream = connectedSock.outputStream
             connectedDevice = dev
 
             sendActor = sendScope.actor(capacity = Channel.UNLIMITED) {

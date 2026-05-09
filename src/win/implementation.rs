@@ -6,23 +6,24 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 
-use windows::core::{GUID, PCWSTR};
 use windows::Win32::Devices::Bluetooth::{
+    AF_BTH, BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
     BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
     BluetoothFindFirstRadio, BluetoothFindNextDevice, BluetoothFindRadioClose,
-    BluetoothGetDeviceInfo, MITMProtectionNotRequired, AF_BTH, BLUETOOTH_DEVICE_INFO,
-    BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS, HBLUETOOTH_DEVICE_FIND,
-    HBLUETOOTH_RADIO_FIND, SOCKADDR_BTH,
+    BluetoothGetDeviceInfo, HBLUETOOTH_DEVICE_FIND, HBLUETOOTH_RADIO_FIND,
+    MITMProtectionNotRequired, SOCKADDR_BTH,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, HANDLE, TRUE,
+    CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, GetLastError, HANDLE, TRUE,
     WAIT_OBJECT_0,
 };
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, recv, send, shutdown, socket, WSACleanup, WSAGetLastError, WSAStartup,
-    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCKET, SOCK_STREAM, WSADATA, WSAEWOULDBLOCK,
+    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCK_STREAM, SOCKET, WSACleanup, WSADATA,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, closesocket, connect, recv, send, shutdown,
+    socket,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::core::{GUID, PCWSTR};
 
 use crate::SPPDevice;
 
@@ -139,6 +140,25 @@ static BT_STATE: Lazy<Arc<Mutex<GlobalState>>> =
 pub mod core {
 
     use super::*;
+
+    fn normalized_fallback_channels(fallback_channels: &[u8]) -> Vec<u8> {
+        let source: Vec<u8> = if fallback_channels.is_empty() {
+            vec![5, 1]
+        } else {
+            fallback_channels.to_vec()
+        };
+
+        let mut out = Vec::new();
+        for channel in source {
+            if channel != 0 && !out.contains(&channel) {
+                out.push(channel);
+            }
+        }
+        if out.is_empty() {
+            out.extend([5, 1]);
+        }
+        out
+    }
 
     fn init_winsock_if_needed() -> Result<()> {
         let mut state = BT_STATE
@@ -526,8 +546,16 @@ pub mod core {
     }
 
     pub fn connect_impl(addr_str: &str) -> Result<bool> {
+        connect_impl_with_fallback_channels(addr_str, &[5, 1])
+    }
+
+    pub fn connect_impl_with_fallback_channels(
+        addr_str: &str,
+        fallback_channels: &[u8],
+    ) -> Result<bool> {
         init_winsock_if_needed()?;
         stop_scan_impl()?;
+        let fallback_channels = normalized_fallback_channels(fallback_channels);
 
         let old_join_handle_opt = {
             let mut state = BT_STATE
@@ -626,21 +654,49 @@ pub mod core {
             unsafe { CloseHandle(radio_handle).ok() };
         }
 
-        let sock = attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None)
-            .or_else(|e| {
+        let mut sock_opt = None;
+        let mut last_error: Option<anyhow::Error> = None;
+        match attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None) {
+            Ok(sock) => sock_opt = Some(sock),
+            Err(e) => {
+                warn!("SPP Service UUID failed for {}: {:?}", addr_str, e);
+                last_error = Some(e);
+            }
+        }
+
+        if sock_opt.is_none() {
+            info!(
+                "Windows RFCOMM fallback channel attempt order for {}: {:?}",
+                addr_str, fallback_channels
+            );
+            for channel in fallback_channels {
                 warn!(
-                    "SPP Service UUID failed for {}: {:?}. Trying RFCOMM channel 5...",
-                    addr_str, e
+                    "Trying RFCOMM channel {} for {} after SPP UUID failure...",
+                    channel, addr_str
                 );
-                attempt_connect(target_bth_addr, None, Some(5))
-            })
-            .or_else(|e| {
-                warn!(
-                    "RFCOMM Channel 5 failed for {}: {:?}. Trying channel 1...",
-                    addr_str, e
-                );
-                attempt_connect(target_bth_addr, None, Some(1))
-            })?;
+                match attempt_connect(target_bth_addr, None, Some(channel as u32)) {
+                    Ok(sock) => {
+                        sock_opt = Some(sock);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "RFCOMM Channel {} failed for {}: {:?}",
+                            channel, addr_str, e
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+        }
+
+        let sock = sock_opt.ok_or_else(|| {
+            corelib::anyhow_site!(
+                "SPP Service UUID and fallback RFCOMM channels failed for {}: {:?}",
+                addr_str,
+                last_error
+            )
+        })?;
         info!("SPP Connection successful to {}", addr_str);
 
         let cb_ptr_opt: Option<ConnectedCallbackPtr> = {

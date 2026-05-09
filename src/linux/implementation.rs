@@ -6,8 +6,8 @@ use bluer::rfcomm::{Profile, ReqError, Role, SocketAddr, Stream};
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session, Uuid};
 use futures_util::stream::StreamExt;
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Runtime;
@@ -151,6 +151,25 @@ async fn connect_spp_uuid(addr: Address) -> Result<Stream> {
 pub mod core {
     use super::*;
 
+    fn normalized_fallback_channels(fallback_channels: &[u8]) -> Vec<u8> {
+        let source: Vec<u8> = if fallback_channels.is_empty() {
+            vec![5, 1]
+        } else {
+            fallback_channels.to_vec()
+        };
+
+        let mut out = Vec::new();
+        for channel in source {
+            if channel != 0 && !out.contains(&channel) {
+                out.push(channel);
+            }
+        }
+        if out.is_empty() {
+            out.extend([5, 1]);
+        }
+        out
+    }
+
     pub fn start_scan_impl() -> Result<()> {
         stop_scan_impl()?;
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -256,10 +275,18 @@ pub mod core {
     }
 
     pub fn connect_impl(addr_str: &str) -> Result<bool> {
+        connect_impl_with_fallback_channels(addr_str, &[5, 1])
+    }
+
+    pub fn connect_impl_with_fallback_channels(
+        addr_str: &str,
+        fallback_channels: &[u8],
+    ) -> Result<bool> {
         stop_scan_impl()?;
         disconnect_impl()?;
 
         let addr_clone = addr_str.to_string();
+        let fallback_channels = normalized_fallback_channels(fallback_channels);
 
         // 修复：使用 block_in_place，并让其闭包返回 Result
         tokio::task::block_in_place(|| {
@@ -288,8 +315,12 @@ pub mod core {
                 }
 
                 if stream.is_none() {
-                    let channels_to_try = [5, 1];
-                    for &channel in &channels_to_try {
+                    log::info!(
+                        "Linux RFCOMM fallback channel attempt order for {}: {:?}",
+                        addr,
+                        fallback_channels
+                    );
+                    for &channel in &fallback_channels {
                         let sock_addr = SocketAddr::new(addr, channel);
                         log::info!("Attempting to connect to {} on channel {}", addr, channel);
                         match tokio::time::timeout(

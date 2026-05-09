@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use tauri::{plugin::PluginApi, AppHandle, Runtime};
+use tauri::{AppHandle, Runtime, plugin::PluginApi};
 
 #[cfg(target_os = "windows")]
 #[path = "./win/implementation.rs"]
@@ -43,6 +43,16 @@ impl<R: Runtime> BtclassicSpp<R> {
     // remove bond参数仅在安卓端起效
     pub fn connect(&self, addr: &String, _remove_bond: bool) -> anyhow::Result<ConnectResult> {
         core::connect_impl(addr).map(|success| ConnectResult { ret: success })
+    }
+
+    pub fn connect_with_fallback_channels(
+        &self,
+        addr: &String,
+        _remove_bond: bool,
+        fallback_channels: &[u8],
+    ) -> anyhow::Result<ConnectResult> {
+        core::connect_impl_with_fallback_channels(addr, fallback_channels)
+            .map(|success| ConnectResult { ret: success })
     }
 
     pub fn get_connected_device_info(&self) -> anyhow::Result<SPPDevice> {

@@ -2,7 +2,7 @@ use anyhow::Result;
 use dispatch::Queue;
 use objc2::rc::Retained;
 use objc2::runtime::NSObjectProtocol;
-use objc2::{define_class, msg_send, ClassType, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{ClassType, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send};
 use objc2_foundation::{NSObject, NSString};
 use objc2_io_bluetooth::{
     BluetoothRFCOMMChannelID, IOBluetoothDevice, IOBluetoothDeviceInquiry,
@@ -12,7 +12,7 @@ use objc2_io_kit::kIOReturnSuccess;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::models::SPPDevice;
@@ -394,6 +394,26 @@ pub mod core {
 
     use super::*;
 
+    fn normalized_fallback_channels(fallback_channels: &[u8]) -> Vec<BluetoothRFCOMMChannelID> {
+        let source: Vec<u8> = if fallback_channels.is_empty() {
+            vec![5, 1]
+        } else {
+            fallback_channels.to_vec()
+        };
+
+        let mut out = Vec::new();
+        for ch in source {
+            let ch_id = ch as BluetoothRFCOMMChannelID;
+            if ch_id != 0 && !out.contains(&ch_id) {
+                out.push(ch_id);
+            }
+        }
+        if out.is_empty() {
+            out.extend([5, 1]);
+        }
+        out
+    }
+
     fn get_or_create_delegate(mtm: MainThreadMarker) -> Result<Retained<BTDelegate>> {
         MAIN_THREAD_STATE.with(|cell| {
             let mut s = cell.borrow_mut();
@@ -449,6 +469,17 @@ pub mod core {
     }
 
     /* ---------- 根据 SPP UUID 解析 RFCOMM Channel ---------- */
+    fn rfcomm_channel_from_record(
+        record: &IOBluetoothSDPServiceRecord,
+    ) -> Option<BluetoothRFCOMMChannelID> {
+        let mut ch: BluetoothRFCOMMChannelID = 0;
+        if unsafe { record.getRFCOMMChannelID(&mut ch) } == kIOReturnSuccess && ch != 0 {
+            Some(ch)
+        } else {
+            None
+        }
+    }
+
     fn resolve_spp_channel(device: &IOBluetoothDevice) -> Option<BluetoothRFCOMMChannelID> {
         // 0x1101 = Serial Port Profile UUID-16
         const SPP_UUID16: u16 = 0x1101;
@@ -457,25 +488,59 @@ pub mod core {
             let uuid_opt = IOBluetoothSDPUUID::uuid16(SPP_UUID16);
             let uuid = uuid_opt?;
 
-            // 同步 SDP 查询（阻塞 ≤10 s，已在主线程）
-            let _ = device.performSDPQuery(None);
-
-            let record_opt: Option<Retained<IOBluetoothSDPServiceRecord>> =
+            let cached_record: Option<Retained<IOBluetoothSDPServiceRecord>> =
                 device.getServiceRecordForUUID(Some(&*uuid));
-            let record = record_opt?;
-
-            let mut ch: BluetoothRFCOMMChannelID = 0;
-            if record.getRFCOMMChannelID(&mut ch) == kIOReturnSuccess && ch != 0 {
-                Some(ch)
-            } else {
-                None
+            if let Some(record) = cached_record {
+                if let Some(ch) = rfcomm_channel_from_record(&record) {
+                    log::info!("macOS SDP cache resolved SPP RFCOMM channel {}", ch);
+                    return Some(ch);
+                }
             }
+
+            // IOBluetooth 的 SDP 查询是异步的；这里在短窗口内轮询查询结果，
+            // 避免还没等到 service record 就直接落到硬编码 channel。
+            let status = device.performSDPQuery(None);
+            if status != kIOReturnSuccess {
+                log::warn!(
+                    "macOS SDP query failed to start for SPP UUID 0x1101: {}",
+                    status
+                );
+                return None;
+            }
+
+            log::info!("macOS SDP query started for SPP UUID 0x1101; waiting for service record");
+            for attempt in 1..=30 {
+                std::thread::sleep(Duration::from_millis(100));
+                let record_opt: Option<Retained<IOBluetoothSDPServiceRecord>> =
+                    device.getServiceRecordForUUID(Some(&*uuid));
+                if let Some(record) = record_opt {
+                    if let Some(ch) = rfcomm_channel_from_record(&record) {
+                        log::info!(
+                            "macOS SDP resolved SPP RFCOMM channel {} after {}ms",
+                            ch,
+                            attempt * 100
+                        );
+                        return Some(ch);
+                    }
+                }
+            }
+
+            log::warn!("macOS SDP did not resolve SPP RFCOMM channel; using fallback channels");
+            None
         }
     }
 
     /* ---- 连接 ---- */
     pub fn connect_impl(addr_str: &str) -> Result<bool> {
+        connect_impl_with_fallback_channels(addr_str, &[5, 1])
+    }
+
+    pub fn connect_impl_with_fallback_channels(
+        addr_str: &str,
+        fallback_channels: &[u8],
+    ) -> Result<bool> {
         let addr = addr_str.to_string();
+        let fallback_channels = normalized_fallback_channels(fallback_channels);
         run_on_main_thread(move |mtm| {
             stop_scan_impl().ok();
 
@@ -497,10 +562,19 @@ pub mod core {
 
             let delegate = get_or_create_delegate(mtm)?;
 
-            /* 计算要尝试的 Channel 列表：SDP → 5 → 1 */
+            /* 计算要尝试的 Channel 列表：SDP → 上层按设备厂商给出的 fallback */
             let mut try_channels: Vec<BluetoothRFCOMMChannelID> =
                 resolve_spp_channel(&dev).into_iter().collect();
-            try_channels.extend([5, 1]);
+            for ch_id in &fallback_channels {
+                if !try_channels.contains(ch_id) {
+                    try_channels.push(*ch_id);
+                }
+            }
+            log::info!(
+                "macOS RFCOMM channel attempt order for {}: {:?}",
+                addr,
+                try_channels
+            );
 
             let mut last_error = None;
             for ch_id in try_channels {

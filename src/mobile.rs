@@ -1,11 +1,11 @@
-use base64::{engine::general_purpose, Engine};
+use base64::{Engine, engine::general_purpose};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri::{
+    AppHandle, Runtime,
     ipc::{Channel, InvokeResponseBody},
     plugin::{PluginApi, PluginHandle},
-    AppHandle, Runtime,
 };
 
 use crate::models::*;
@@ -49,6 +49,21 @@ impl<R: Runtime> BtclassicSpp<R> {
         let arg = ConnectArg {
             addr: addr.to_owned(),
             remove_bond,
+            fallback_channels: Vec::new(),
+        };
+        self.0.run_mobile_plugin("connect", arg).map_err(Into::into)
+    }
+
+    pub fn connect_with_fallback_channels(
+        &self,
+        addr: &String,
+        remove_bond: bool,
+        fallback_channels: &[u8],
+    ) -> anyhow::Result<ConnectResult> {
+        let arg = ConnectArg {
+            addr: addr.to_owned(),
+            remove_bond,
+            fallback_channels: fallback_channels.to_vec(),
         };
         self.0.run_mobile_plugin("connect", arg).map_err(Into::into)
     }

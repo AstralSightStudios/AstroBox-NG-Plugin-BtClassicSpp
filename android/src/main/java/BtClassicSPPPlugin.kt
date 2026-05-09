@@ -17,6 +17,7 @@ import java.io.IOException
 class ConnectArg {
     lateinit var addr: String
     var remove_bond: Boolean = true
+    var fallback_channels: IntArray = intArrayOf()
 }
 
 @TauriPlugin
@@ -69,7 +70,12 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         webView.evaluateJavascript("console.log('Kotlin: Connecting to device ${args.addr}')", null)
 
         CoroutineScope(Dispatchers.IO).launch {
-            val (isSuccessful, err) = implementation.connect(activity, args.addr, args.remove_bond)
+            val (isSuccessful, err) = implementation.connect(
+                activity,
+                args.addr,
+                args.remove_bond,
+                args.fallback_channels.toList(),
+            )
             if (isSuccessful) {
                 val ret = JSObject()
                 ret.put("ret", true)

@@ -11,6 +11,8 @@ pub struct SPPDevice {
 pub struct ConnectArg {
     pub addr: String,
     pub remove_bond: bool,
+    #[serde(default)]
+    pub fallback_channels: Vec<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
