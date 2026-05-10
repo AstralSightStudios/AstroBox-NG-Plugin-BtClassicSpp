@@ -1,11 +1,11 @@
-use base64::{Engine, engine::general_purpose};
+use base64::{engine::general_purpose, Engine};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri::{
-    AppHandle, Runtime,
     ipc::{Channel, InvokeResponseBody},
     plugin::{PluginApi, PluginHandle},
+    AppHandle, Runtime,
 };
 
 use crate::models::*;
