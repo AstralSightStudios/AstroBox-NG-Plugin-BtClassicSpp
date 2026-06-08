@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use crate::models::SPPDevice;
 
+#[path = "audio_guard.rs"]
+mod audio_guard;
+
 /* ---------- Address format helpers ---------- */
 /// Convert macOS-delivered address (typically with `-` separators) to the
 /// canonical `XX:XX:XX:XX:XX:XX` form used across platforms.
@@ -560,6 +563,11 @@ pub mod core {
                 let _status: i32 = msg_send![dev_ref, closeConnection];
             }
 
+            let dev_name = unsafe { dev.nameOrAddress() }.map(|s| s.to_string());
+
+            /* 连接前记录默认输出并启动 CoreAudio 守护：被手表抢占系统音频时切回。 */
+            audio_guard::start(&addr, dev_name.clone());
+
             let delegate = get_or_create_delegate(mtm)?;
 
             /* 计算要尝试的 Channel 列表：SDP → 上层按设备厂商给出的 fallback */
@@ -600,7 +608,7 @@ pub mod core {
                             corelib::anyhow_site!("Failed to acquire Bluetooth state lock")
                         })?
                         .connected_device_info = Some(SPPDevice {
-                        name: unsafe { dev.nameOrAddress() }.map(|s| s.to_string()),
+                        name: dev_name.clone(),
                         address: addr.clone(),
                     });
 
@@ -611,7 +619,8 @@ pub mod core {
                 log::warn!("Channel {} rejected (err {})", ch_id, status);
             }
 
-            /* 全部通道失败 */
+            /* 全部通道失败：停掉音频守护，避免悬留监听 */
+            audio_guard::stop();
             corelib::bail_site!("All RFCOMM channel attempts failed (last={:?})", last_error);
         })
     }
@@ -725,6 +734,8 @@ pub mod core {
 
     pub fn disconnect_impl() -> Result<()> {
         run_on_main_thread(|_mtm| {
+            // 断开即不再有手表，撤掉音频守护，恢复系统默认输出行为。
+            audio_guard::stop();
             let maybe_chan = MAIN_THREAD_STATE.with(|c| c.borrow_mut().rfcomm_channel.take());
             if let Some(chan) = maybe_chan {
                 let status = unsafe { chan.closeChannel() };
