@@ -45,6 +45,18 @@ impl<R: Runtime> BtclassicSpp<R> {
             .map_err(Into::into)
     }
 
+    pub fn start_ble_scan(&self) -> anyhow::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("startBleScan", ())
+            .map_err(Into::into)
+    }
+
+    pub fn stop_ble_scan(&self) -> anyhow::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("stopBleScan", ())
+            .map_err(Into::into)
+    }
+
     pub fn connect(&self, addr: &String, remove_bond: bool) -> anyhow::Result<ConnectResult> {
         let arg = ConnectArg {
             addr: addr.to_owned(),
@@ -68,15 +80,38 @@ impl<R: Runtime> BtclassicSpp<R> {
         self.0.run_mobile_plugin("connect", arg).map_err(Into::into)
     }
 
+    pub fn connect_ble(&self, addr: &String) -> anyhow::Result<ConnectResult> {
+        let arg = ConnectArg {
+            addr: addr.to_owned(),
+            remove_bond: false,
+            fallback_channels: Vec::new(),
+        };
+        self.0
+            .run_mobile_plugin("connectBle", arg)
+            .map_err(Into::into)
+    }
+
     pub fn disconnect(&self) -> anyhow::Result<()> {
         self.0
             .run_mobile_plugin::<()>("disconnect", ())
             .map_err(Into::into)
     }
 
+    pub fn disconnect_ble(&self) -> anyhow::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("disconnectBle", ())
+            .map_err(Into::into)
+    }
+
     pub fn start_subscription(&self) -> anyhow::Result<()> {
         self.0
             .run_mobile_plugin::<()>("startSubscription", ())
+            .map_err(Into::into)
+    }
+
+    pub fn start_ble_subscription(&self) -> anyhow::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>("startBleSubscription", ())
             .map_err(Into::into)
     }
 
@@ -91,10 +126,27 @@ impl<R: Runtime> BtclassicSpp<R> {
             .map_err(Into::into)
     }
 
+    pub fn send_ble(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.0
+            .run_mobile_plugin::<()>(
+                "sendBle",
+                SPPSendPayload {
+                    b64data: general_purpose::STANDARD.encode(data),
+                },
+            )
+            .map_err(Into::into)
+    }
+
     /* ---------- 有返回值调用 ---------- */
     pub fn get_scanned_devices(&self) -> anyhow::Result<GetScannedDevicesResult> {
         self.0
             .run_mobile_plugin("getScannedDevices", ())
+            .map_err(Into::into)
+    }
+
+    pub fn get_ble_scanned_devices(&self) -> anyhow::Result<GetScannedDevicesResult> {
+        self.0
+            .run_mobile_plugin("getBleScannedDevices", ())
             .map_err(Into::into)
     }
 
@@ -108,6 +160,14 @@ impl<R: Runtime> BtclassicSpp<R> {
         let ret: GetMaxSendLenResult = self
             .0
             .run_mobile_plugin("getMaxSendLen", ())
+            .map_err(anyhow::Error::from)?;
+        Ok(ret.ret)
+    }
+
+    pub fn get_ble_max_send_len(&self) -> anyhow::Result<Option<usize>> {
+        let ret: GetMaxSendLenResult = self
+            .0
+            .run_mobile_plugin("getBleMaxSendLen", ())
             .map_err(anyhow::Error::from)?;
         Ok(ret.ret)
     }

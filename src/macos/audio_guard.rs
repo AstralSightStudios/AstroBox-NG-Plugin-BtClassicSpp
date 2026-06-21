@@ -267,12 +267,12 @@ unsafe extern "C" fn default_output_changed(
 
     if preferred != 0 && preferred != current && !is_watch_device(preferred, &mac, &name) {
         if set_default_output(preferred) {
-            log::info!(
-                "audio_guard: 手表抢占了默认输出，已切回设备 {}",
+            log::info!("audio_guard: 手表抢占了默认输出，已切回设备 {}", preferred);
+        } else {
+            log::warn!(
+                "audio_guard: 尝试切回默认输出失败 (preferred={})",
                 preferred
             );
-        } else {
-            log::warn!("audio_guard: 尝试切回默认输出失败 (preferred={})", preferred);
         }
     } else {
         log::warn!("audio_guard: 手表抢占了默认输出，但没有可恢复的目标设备");

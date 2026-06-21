@@ -5,8 +5,19 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.BluetoothSocket
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Context.RECEIVER_EXPORTED
@@ -25,9 +36,13 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.channels.actor
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -36,6 +51,18 @@ import kotlin.coroutines.resumeWithException
 class BTSpp(private val context: Context, private val webView: WebView) {
 
     private val SPP_PREFIX = "00001101"
+    private val BLE_UUID_KEYWORD_XIAOMI_SERVICE = "0050"
+    private val BLE_UUID_KEYWORD_XIAOMI_SENT = "005f"
+    private val BLE_UUID_KEYWORD_XIAOMI_RECV = "005e"
+    private val BLE_UUID_VIVO_SERVICE = "0000276008c211e190730e8ac72e1011"
+    private val BLE_UUID_VIVO_SENT = "0000276008c211e190730e8ac72e0011"
+    private val BLE_UUID_VIVO_RECV = "0000276008c211e190730e8ac72e0012"
+    private val VIVO_MANUFACTURER_ID = 2103
+    private val BLE_DEFAULT_MTU = 23
+    private val BLE_REQUESTED_MTU = 247
+    private val BLE_WRITE_DELAY_MS = 12L
+    private val CLIENT_CHARACTERISTIC_CONFIG_UUID =
+        UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val STREAM_WRITE_HINT = 60 * 1024
     private val PERMISSION_REQUEST_CODE = 1001
     private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
@@ -48,11 +75,34 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     private val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private val scannedDevices = mutableListOf<BluetoothDevice>()
+    data class BleScannedDevice(val name: String?, val address: String)
+    private data class VivoAdvertisementInfo(
+        val protocolVersion: Int,
+        val mask: Int,
+        val productId: Int,
+        val mac: String,
+    )
+    private val bleScannedDevices = mutableListOf<BleScannedDevice>()
+    private val bleDeviceCache = mutableMapOf<String, BluetoothDevice>()
+    private var bleScanCallback: ScanCallback? = null
 
     private var socket: BluetoothSocket? = null
     private var inStream: InputStream? = null
     private var outStream: OutputStream? = null
     private var connectedDevice: BluetoothDevice? = null
+
+    private var bleGatt: BluetoothGatt? = null
+    private var bleConnectedDevice: BluetoothDevice? = null
+    private var bleWriteCharacteristic: BluetoothGattCharacteristic? = null
+    private var bleNotifyCharacteristic: BluetoothGattCharacteristic? = null
+    private var bleServiceProbeCharacteristic: BluetoothGattCharacteristic? = null
+    @Volatile private var bleMtu: Int = BLE_DEFAULT_MTU
+    private var bleConnectDeferred: CompletableDeferred<Boolean>? = null
+    private var bleServicesDeferred: CompletableDeferred<Boolean>? = null
+    private var bleMtuDeferred: CompletableDeferred<Int>? = null
+    private var bleDescriptorWriteDeferred: CompletableDeferred<Boolean>? = null
+    private val bleSendMutex = Mutex()
+    @Volatile private var bleManualDisconnect: Boolean = false
 
     private val sendScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var sendActor: SendChannel<ByteArray>? = null
@@ -179,6 +229,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     fun getScannedDevices(): List<BluetoothDevice> = scannedDevices.toList()
     fun getConnectedDeviceInfo(): BluetoothDevice? = connectedDevice
     fun getMaxSendLen(): Int? = if (connectedDevice != null) STREAM_WRITE_HINT else null
+    fun getBleScannedDevices(): List<BleScannedDevice> = synchronized(bleScannedDevices) {
+        bleScannedDevices.toList()
+    }
+    fun getBleConnectedDeviceInfo(): BluetoothDevice? = bleConnectedDevice
+    fun getBleMaxSendLen(): Int? {
+        if (bleGatt == null || bleWriteCharacteristic == null) return null
+        return (bleMtu - 3).coerceAtLeast(20)
+    }
     fun setDataListener(listener: DataListener) { dataListener = listener }
 
     fun initPermissions() {
@@ -188,6 +246,76 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private suspend fun webViewLog(content: String) {
         withContext(Dispatchers.Main) {
             webView.evaluateJavascript("console.log('$content')", null)
+        }
+    }
+
+    private fun normalizeBluetoothAddress(raw: String): String {
+        val hex = raw.filter { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+        if (hex.length >= 12) {
+            return hex.takeLast(12)
+                .chunked(2)
+                .joinToString(":") { it.uppercase(Locale.US) }
+        }
+        return raw.trim().uppercase(Locale.US)
+    }
+
+    private fun uuidCompact(uuid: UUID): String =
+        uuid.toString().replace("-", "").lowercase(Locale.US)
+
+    private fun uuidContains(uuid: UUID, keyword: String): Boolean =
+        uuidCompact(uuid).contains(keyword.lowercase(Locale.US))
+
+    private fun uuidCompactEq(uuid: UUID, expected: String): Boolean =
+        uuidCompact(uuid) == expected.lowercase(Locale.US)
+
+    private fun isVivoWatchName(name: String?): Boolean {
+        val normalized = name?.trim()?.lowercase(Locale.US) ?: return false
+        return normalized.startsWith("vivo watch") || normalized.startsWith("iqoo watch")
+    }
+
+    private fun parseVivoManufacturerData(data: ByteArray?): VivoAdvertisementInfo? {
+        if (data == null || data.size < 12 || data[0].toInt() != 0) return null
+        val protocolVersion = data[1].toInt() and 0xff
+        val mask = (data[2].toInt() and 0xff) or ((data[3].toInt() and 0xff) shl 8)
+        val productId = (data[4].toInt() and 0xff) or ((data[5].toInt() and 0xff) shl 8)
+        val macBytes = data.copyOfRange(6, 12)
+        if (macBytes.all { it.toInt() == 0 }) return null
+        val mac = macBytes.joinToString(":") { "%02X".format(it.toInt() and 0xff) }
+        return VivoAdvertisementInfo(protocolVersion, mask, productId, mac)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun rememberBleScanResult(result: ScanResult) {
+        val record = result.scanRecord
+        val device = result.device ?: return
+        val vivoInfo = parseVivoManufacturerData(
+            record?.manufacturerSpecificData?.get(VIVO_MANUFACTURER_ID)
+        )
+        val name = record?.deviceName ?: runCatching { device.name }.getOrNull().orEmpty()
+        val emitAddress = when {
+            vivoInfo != null -> {
+                uiHandler.post {
+                    webView.evaluateJavascript(
+                        "console.log('Kotlin BLE: vivo advertisement raw=${device.address} mac=${vivoInfo.mac} product=${vivoInfo.productId} mask=${vivoInfo.mask} protocol=${vivoInfo.protocolVersion}')",
+                        null
+                    )
+                }
+                vivoInfo.mac
+            }
+            isVivoWatchName(name) -> device.address
+            else -> return
+        }
+
+        val key = normalizeBluetoothAddress(emitAddress)
+        if (key.isEmpty()) return
+
+        synchronized(bleScannedDevices) {
+            if (bleScannedDevices.any { normalizeBluetoothAddress(it.address) == key }) return
+            bleScannedDevices.add(BleScannedDevice(name.ifEmpty { null }, emitAddress))
+        }
+        synchronized(bleDeviceCache) {
+            bleDeviceCache[key] = device
+            bleDeviceCache[normalizeBluetoothAddress(device.address)] = device
         }
     }
 
@@ -215,6 +343,53 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     fun stopScan() {
         adapter?.cancelDiscovery()
         try { context.unregisterReceiver(scanReceiver) } catch (_: IllegalArgumentException) {}
+    }
+
+    @SuppressLint("MissingPermission")
+    fun startBleScan() {
+        if (!ensureRuntimePermissions(requestIfMissing = false)) {
+            showPreciseLocationRequiredDialogIfNeeded()
+            return
+        }
+
+        stopBleScan()
+        synchronized(bleScannedDevices) { bleScannedDevices.clear() }
+        synchronized(bleDeviceCache) { bleDeviceCache.clear() }
+
+        val scanner = adapter?.bluetoothLeScanner ?: return
+        val callback = object : ScanCallback() {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
+                rememberBleScanResult(result)
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                results.forEach(::rememberBleScanResult)
+            }
+
+            override fun onScanFailed(errorCode: Int) {
+                uiHandler.post {
+                    webView.evaluateJavascript(
+                        "console.warn('Kotlin BLE: scan failed code=$errorCode')",
+                        null
+                    )
+                }
+            }
+        }
+
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+        bleScanCallback = callback
+        scanner.startScan(emptyList<ScanFilter>(), settings, callback)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun stopBleScan() {
+        val callback = bleScanCallback ?: return
+        bleScanCallback = null
+        runCatching {
+            adapter?.bluetoothLeScanner?.stopScan(callback)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -420,6 +595,276 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         }.getOrNull()
     }
 
+    private fun emitBleData(data: ByteArray) {
+        val bytes = data.copyOf()
+        uiHandler.post { dataListener?.onDataReceived(bytes) }
+    }
+
+    private val bleGattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    bleConnectDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+                    bleConnectDeferred = null
+                }
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    bleConnectDeferred?.complete(false)
+                    bleConnectDeferred = null
+                    if (!bleManualDisconnect && bleConnectedDevice != null) {
+                        uiHandler.post {
+                            dataListener?.onError(IOException("BLE disconnected: status=$status"))
+                        }
+                    }
+                    bleConnectedDevice = null
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            bleServicesDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+            bleServicesDeferred = null
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            val acceptedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else BLE_DEFAULT_MTU
+            bleMtu = acceptedMtu
+            bleMtuDeferred?.complete(acceptedMtu)
+            bleMtuDeferred = null
+        }
+
+        override fun onDescriptorWrite(
+            gatt: BluetoothGatt,
+            descriptor: BluetoothGattDescriptor,
+            status: Int
+        ) {
+            bleDescriptorWriteDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+            bleDescriptorWriteDeferred = null
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            characteristic.value?.let(::emitBleData)
+        }
+
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            emitBleData(value)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun resolveBleDevice(address: String): BluetoothDevice? {
+        val key = normalizeBluetoothAddress(address)
+        synchronized(bleDeviceCache) {
+            bleDeviceCache[key]?.let { return it }
+        }
+
+        val directDevice = runCatching { adapter?.getRemoteDevice(address) }.getOrNull()
+        startBleScan()
+        val deadline = System.currentTimeMillis() + 12_000L
+        while (System.currentTimeMillis() < deadline) {
+            synchronized(bleDeviceCache) {
+                bleDeviceCache[key]?.let {
+                    stopBleScan()
+                    return it
+                }
+            }
+            delay(150)
+        }
+        stopBleScan()
+        return directDevice
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun requestBleMtu(gatt: BluetoothGatt): Int {
+        val deferred = CompletableDeferred<Int>()
+        bleMtuDeferred = deferred
+        if (!gatt.requestMtu(BLE_REQUESTED_MTU)) {
+            bleMtuDeferred = null
+            return BLE_DEFAULT_MTU
+        }
+        return withTimeoutOrNull(4_000L) { deferred.await() } ?: BLE_DEFAULT_MTU
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun discoverBleServices(gatt: BluetoothGatt): Boolean {
+        val deferred = CompletableDeferred<Boolean>()
+        bleServicesDeferred = deferred
+        if (!gatt.discoverServices()) {
+            bleServicesDeferred = null
+            return false
+        }
+        return withTimeoutOrNull(10_000L) { deferred.await() } == true
+    }
+
+    private fun extractBleCharacteristics(services: List<BluetoothGattService>): Boolean {
+        var recv: BluetoothGattCharacteristic? = null
+        var sent: BluetoothGattCharacteristic? = null
+        var serviceProbe: BluetoothGattCharacteristic? = null
+
+        for (service in services) {
+            val serviceUuid = service.uuid
+            val isXiaomi = uuidContains(serviceUuid, "fe95")
+            val isVivo = uuidCompactEq(serviceUuid, BLE_UUID_VIVO_SERVICE)
+            if (!isXiaomi && !isVivo) continue
+
+            for (characteristic in service.characteristics) {
+                val characteristicUuid = characteristic.uuid
+                when {
+                    isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_RECV) ->
+                        recv = characteristic
+                    isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_SENT) ->
+                        sent = characteristic
+                    isXiaomi && uuidContains(characteristicUuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE) ->
+                        serviceProbe = characteristic
+                    isVivo && uuidCompactEq(characteristicUuid, BLE_UUID_VIVO_RECV) ->
+                        recv = characteristic
+                    isVivo && uuidCompactEq(characteristicUuid, BLE_UUID_VIVO_SENT) ->
+                        sent = characteristic
+                }
+            }
+        }
+
+        bleNotifyCharacteristic = recv
+        bleWriteCharacteristic = sent
+        bleServiceProbeCharacteristic = serviceProbe
+        return recv != null && sent != null
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun connectBle(address: String): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
+        try {
+            if (!ensureRuntimePermissions(requestIfMissing = false)) {
+                showPreciseLocationRequiredDialogIfNeeded()
+                return@withContext false to missingPermissionsMessage()
+            }
+
+            val dev = resolveBleDevice(address)
+                ?: return@withContext false to "BLE device not found: $address"
+
+            adapter?.cancelDiscovery()
+            disconnectBle()
+            bleManualDisconnect = false
+
+            val connectedDeferred = CompletableDeferred<Boolean>()
+            bleConnectDeferred = connectedDeferred
+            val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                dev.connectGatt(context, false, bleGattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                dev.connectGatt(context, false, bleGattCallback)
+            } ?: return@withContext false to "connectGatt returned null"
+
+            bleGatt = gatt
+            val connected = withTimeoutOrNull(15_000L) { connectedDeferred.await() } == true
+            if (!connected) {
+                disconnectBle()
+                return@withContext false to "BLE GATT connection timed out or failed"
+            }
+
+            bleMtu = requestBleMtu(gatt)
+
+            if (!discoverBleServices(gatt)) {
+                disconnectBle()
+                return@withContext false to "BLE service discovery failed"
+            }
+
+            if (!extractBleCharacteristics(gatt.services)) {
+                disconnectBle()
+                return@withContext false to "BLE VSCP characteristics not found"
+            }
+
+            bleConnectedDevice = dev
+            true to null
+        } catch (e: Exception) {
+            disconnectBle()
+            false to (e.message ?: e.toString())
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun startBleSubscription(): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
+        val gatt = bleGatt ?: return@withContext false to "BLE GATT not connected"
+        val characteristic = bleNotifyCharacteristic
+            ?: return@withContext false to "BLE notify characteristic not found"
+
+        if (!gatt.setCharacteristicNotification(characteristic, true)) {
+            return@withContext false to "setCharacteristicNotification failed"
+        }
+
+        val descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID)
+        if (descriptor != null) {
+            val deferred = CompletableDeferred<Boolean>()
+            bleDescriptorWriteDeferred = deferred
+            val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeDescriptor(
+                    descriptor,
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                gatt.writeDescriptor(descriptor)
+            }
+            if (!writeStarted) {
+                bleDescriptorWriteDeferred = null
+                return@withContext false to "BLE CCCD write failed to start"
+            }
+            val descriptorOk = withTimeoutOrNull(5_000L) { deferred.await() } == true
+            if (!descriptorOk) {
+                return@withContext false to "BLE CCCD write timed out or failed"
+            }
+        }
+
+        bleServiceProbeCharacteristic?.let { probe ->
+            runCatching {
+                @Suppress("DEPRECATION")
+                gatt.readCharacteristic(probe)
+            }
+        }
+
+        true to null
+    }
+
+    @SuppressLint("MissingPermission")
+    suspend fun sendBle(data: ByteArray): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
+        bleSendMutex.withLock {
+            val gatt = bleGatt ?: return@withLock false to "BLE GATT not connected"
+            val characteristic = bleWriteCharacteristic
+                ?: return@withLock false to "BLE write characteristic not found"
+            val maxLen = getBleMaxSendLen() ?: 20
+            if (data.size > maxLen) {
+                return@withLock false to "BLE packet too long: ${data.size} > $maxLen"
+            }
+
+            characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    characteristic,
+                    data,
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                characteristic.value = data
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(characteristic)
+            }
+            if (!writeStarted) {
+                return@withLock false to "BLE write failed to start"
+            }
+
+            delay(BLE_WRITE_DELAY_MS)
+            true to null
+        }
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     fun send(data: ByteArray): Boolean {
         val actor = sendActor
@@ -465,6 +910,31 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         try { outStream?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
         inStream = null; outStream = null; socket = null; connectedDevice = null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnectBle() {
+        bleManualDisconnect = true
+        stopBleScan()
+
+        bleConnectDeferred?.complete(false)
+        bleConnectDeferred = null
+        bleServicesDeferred?.complete(false)
+        bleServicesDeferred = null
+        bleMtuDeferred?.complete(BLE_DEFAULT_MTU)
+        bleMtuDeferred = null
+        bleDescriptorWriteDeferred?.complete(false)
+        bleDescriptorWriteDeferred = null
+
+        runCatching { bleGatt?.disconnect() }
+        runCatching { bleGatt?.close() }
+        bleGatt = null
+        bleConnectedDevice = null
+        bleWriteCharacteristic = null
+        bleNotifyCharacteristic = null
+        bleServiceProbeCharacteristic = null
+        bleMtu = BLE_DEFAULT_MTU
+        bleManualDisconnect = false
     }
 
     private val scanReceiver = object : BroadcastReceiver() {

@@ -62,6 +62,32 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(JSObject().put("ret", ret))
     }
 
+    /** ------------ BLE 扫描 ------------ **/
+    @SuppressLint("MissingPermission")
+    @Command
+    fun startBleScan(invoke: Invoke) {
+        implementation.startBleScan()
+        invoke.resolve()
+    }
+
+    @Command
+    fun stopBleScan(invoke: Invoke) {
+        implementation.stopBleScan()
+        invoke.resolve()
+    }
+
+    @Command
+    fun getBleScannedDevices(invoke: Invoke) {
+        val ret = JSArray()
+        implementation.getBleScannedDevices().forEach { device ->
+            val obj = JSObject()
+            obj.put("name", device.name)
+            obj.put("address", device.address)
+            ret.put(obj)
+        }
+        invoke.resolve(JSObject().put("ret", ret))
+    }
+
     /** ------------ 连接 ------------ **/
     @SuppressLint("MissingPermission")
     @Command
@@ -87,8 +113,29 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
+    fun connectBle(invoke: Invoke) {
+        val args = invoke.parseArgs(ConnectArg::class.java)
+        webView.evaluateJavascript("console.log('Kotlin: BLE connecting to device ${args.addr}')", null)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            val (isSuccessful, err) = implementation.connectBle(args.addr)
+            if (isSuccessful) {
+                invoke.resolve(JSObject().put("ret", true))
+            } else {
+                invoke.reject("BLE_CONNECT_ERROR", err ?: "Unknown error")
+            }
+        }
+    }
+
+    @Command
     fun disconnect(invoke: Invoke) {
         implementation.disconnect()
+        invoke.resolve()
+    }
+
+    @Command
+    fun disconnectBle(invoke: Invoke) {
+        implementation.disconnectBle()
         invoke.resolve()
     }
 
@@ -120,6 +167,13 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
+    @Command
+    fun getBleMaxSendLen(invoke: Invoke) {
+        val ret = JSObject()
+        ret.put("ret", implementation.getBleMaxSendLen())
+        invoke.resolve(ret)
+    }
+
     /** ------------ 数据监听 ------------ **/
     @Command
     fun setDataListener(invoke: Invoke) {
@@ -147,6 +201,18 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve()
     }
 
+    @Command
+    fun startBleSubscription(invoke: Invoke) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val (isSuccessful, err) = implementation.startBleSubscription()
+            if (isSuccessful) {
+                invoke.resolve()
+            } else {
+                invoke.reject("BLE_SUBSCRIBE_ERROR", err ?: "Unknown error")
+            }
+        }
+    }
+
     /** ------------ 发送 ------------ **/
     @Command
     fun send(invoke: Invoke) {
@@ -154,5 +220,19 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         val data = Base64.decode(args.b64data, Base64.DEFAULT)
         implementation.send(data)
         invoke.resolve()
+    }
+
+    @Command
+    fun sendBle(invoke: Invoke) {
+        val args = invoke.parseArgs(RustTypes.SPPSendPayload::class.java)
+        val data = Base64.decode(args.b64data, Base64.DEFAULT)
+        CoroutineScope(Dispatchers.IO).launch {
+            val (isSuccessful, err) = implementation.sendBle(data)
+            if (isSuccessful) {
+                invoke.resolve()
+            } else {
+                invoke.reject("BLE_SEND_ERROR", err ?: "Unknown error")
+            }
+        }
     }
 }
