@@ -9,19 +9,26 @@ use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use once_cell::sync::Lazy;
 
-use windows::core::{GUID, PCWSTR};
+use windows::core::{BOOL, GUID, PCWSTR};
 use windows::Win32::Devices::Bluetooth::{
     BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
-    BluetoothFindNextDevice, BluetoothGetDeviceInfo, MITMProtectionNotRequired, AF_BTH,
-    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, HBLUETOOTH_DEVICE_FIND, SOCKADDR_BTH,
+    BluetoothFindNextDevice, BluetoothGetDeviceInfo, BluetoothRegisterForAuthenticationEx,
+    BluetoothRemoveDevice, BluetoothSendAuthenticationResponseEx,
+    BluetoothUnregisterAuthentication, MITMProtectionNotRequired, AF_BTH,
+    BLUETOOTH_AUTHENTICATE_RESPONSE, BLUETOOTH_AUTHENTICATE_RESPONSE_0,
+    BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS, BLUETOOTH_AUTHENTICATION_METHOD_LEGACY,
+    BLUETOOTH_AUTHENTICATION_METHOD_NUMERIC_COMPARISON, BLUETOOTH_AUTHENTICATION_METHOD_PASSKEY,
+    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_NUMERIC_COMPARISON_INFO,
+    BLUETOOTH_PASSKEY_INFO, BLUETOOTH_PIN_INFO, HBLUETOOTH_DEVICE_FIND, SOCKADDR_BTH,
 };
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, FALSE, HANDLE, TRUE,
     WAIT_OBJECT_0,
 };
 use windows::Win32::Networking::WinSock::{
-    closesocket, connect, recv, send, shutdown, socket, WSACleanup, WSAGetLastError, WSAStartup,
-    INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCKET, SOCK_STREAM, WSADATA, WSAEWOULDBLOCK,
+    closesocket, connect, recv, send, setsockopt, shutdown, socket, WSACleanup, WSAGetLastError,
+    WSAStartup, INVALID_SOCKET, SD_BOTH, SEND_RECV_FLAGS, SOCKET, SOCK_STREAM, SOL_SOCKET,
+    SO_SNDTIMEO, WSADATA, WSAEACCES, WSAETIMEDOUT, WSAEWOULDBLOCK,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
@@ -32,6 +39,15 @@ const RFCOMM_PORT_ANY: u32 = 0;
 
 const SPP_SERVICE_CLASS_UUID: GUID = GUID::from_u128(0x00001101_0000_1000_8000_00805F9B34FB);
 const SPP_UUID_CONNECT_RETRY_COUNT: usize = 3;
+// RFCOMM 是信用流控:链路半死时阻塞 send 会永远不返回,上层进度就卡死。
+// 有超时后 send 会以 WSAETIMEDOUT 失败,上层能感知并重连。
+const SPP_SEND_TIMEOUT_MS: u32 = 20_000;
+
+#[derive(Debug, thiserror::Error)]
+#[error("connect failed with Win32 error {code}")]
+struct WsaConnectError {
+    code: i32,
+}
 
 type ConnectedCallback = dyn Fn() + Send + Sync + 'static;
 type DataListener = dyn FnMut(Result<Vec<u8>, String>) + Send + 'static;
@@ -586,11 +602,12 @@ pub mod core {
             unsafe { closesocket(sock) };
             let bail_service_class_id = sockaddr.serviceClassId;
             let bail_port = sockaddr.port;
-            corelib::bail_site!(
-                "Connection failed for service {:032X}/port {}: Win32 Error {}",
-                bail_service_class_id.to_u128(),
-                bail_port,
-                err_code
+            return Err(
+                anyhow::Error::new(WsaConnectError { code: err_code }).context(format!(
+                    "Connection failed for service {:032X}/port {}",
+                    bail_service_class_id.to_u128(),
+                    bail_port
+                )),
             );
         }
         let success_service_class_id = sockaddr.serviceClassId;
@@ -600,6 +617,15 @@ pub mod core {
             success_service_class_id.to_u128(),
             success_port
         );
+
+        let timeout_bytes = SPP_SEND_TIMEOUT_MS.to_ne_bytes();
+        let setopt_result =
+            unsafe { setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, Some(&timeout_bytes)) };
+        if setopt_result != 0 {
+            warn!("Failed to set SO_SNDTIMEO: {}", unsafe {
+                WSAGetLastError().0
+            });
+        }
         /*
         // 不启用非阻塞模式，因为会造成一些难以处理的问题
         let mut nonblocking: u32 = 1;
@@ -607,6 +633,183 @@ pub mod core {
             ioctlsocket(sock, FIONBIO as _, &mut nonblocking);
         }*/
         Ok(sock)
+    }
+
+    struct ConnectSequenceFailure {
+        auth_required: bool,
+        last_error: Option<anyhow::Error>,
+    }
+
+    impl ConnectSequenceFailure {
+        fn note(&mut self, e: anyhow::Error) {
+            if e.downcast_ref::<WsaConnectError>()
+                .is_some_and(|w| w.code == WSAEACCES.0)
+            {
+                self.auth_required = true;
+            }
+            self.last_error = Some(e);
+        }
+    }
+
+    fn try_connect_sequence(
+        target_bth_addr: u64,
+        addr_str: &str,
+        fallback_channels: &[u8],
+    ) -> std::result::Result<SOCKET, ConnectSequenceFailure> {
+        let mut failure = ConnectSequenceFailure {
+            auth_required: false,
+            last_error: None,
+        };
+
+        for attempt in 1..=SPP_UUID_CONNECT_RETRY_COUNT {
+            match attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None) {
+                Ok(sock) => return Ok(sock),
+                Err(e) => {
+                    warn!(
+                        "SPP Service UUID attempt {}/{} failed for {}: {:?}",
+                        attempt, SPP_UUID_CONNECT_RETRY_COUNT, addr_str, e
+                    );
+                    failure.note(e);
+                    if attempt < SPP_UUID_CONNECT_RETRY_COUNT {
+                        thread::sleep(Duration::from_millis(250 * attempt as u64));
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Windows RFCOMM fallback channel attempt order for {}: {:?}",
+            addr_str, fallback_channels
+        );
+        for channel in fallback_channels {
+            warn!(
+                "Trying RFCOMM channel {} for {} after SPP UUID failure...",
+                channel, addr_str
+            );
+            match attempt_connect(target_bth_addr, None, Some(*channel as u32)) {
+                Ok(sock) => return Ok(sock),
+                Err(e) => {
+                    warn!("RFCOMM Channel {} failed for {}: {:?}", channel, addr_str, e);
+                    failure.note(e);
+                }
+            }
+        }
+
+        Err(failure)
+    }
+
+    // 自动确认配对请求,替代系统配对向导。向导有概率卡死,
+    // 卡住的认证事务超时后会拖垮整条 ACL 链路,严重时只能重启修复。
+    unsafe extern "system" fn auto_accept_auth_callback(
+        _pvparam: *const std::ffi::c_void,
+        pauthcallbackparams: *const BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS,
+    ) -> BOOL {
+        if pauthcallbackparams.is_null() {
+            return FALSE;
+        }
+        let params = &*pauthcallbackparams;
+
+        let mut response = BLUETOOTH_AUTHENTICATE_RESPONSE::default();
+        response.bthAddressRemote = params.deviceInfo.Address;
+        response.authMethod = params.authenticationMethod;
+        response.negativeResponse = 0;
+
+        match params.authenticationMethod {
+            BLUETOOTH_AUTHENTICATION_METHOD_NUMERIC_COMPARISON => {
+                response.Anonymous = BLUETOOTH_AUTHENTICATE_RESPONSE_0 {
+                    numericCompInfo: BLUETOOTH_NUMERIC_COMPARISON_INFO {
+                        NumericValue: params.Anonymous.Numeric_Value,
+                    },
+                };
+            }
+            BLUETOOTH_AUTHENTICATION_METHOD_PASSKEY => {
+                response.Anonymous = BLUETOOTH_AUTHENTICATE_RESPONSE_0 {
+                    passkeyInfo: BLUETOOTH_PASSKEY_INFO {
+                        passkey: params.Anonymous.Passkey,
+                    },
+                };
+            }
+            BLUETOOTH_AUTHENTICATION_METHOD_LEGACY => {
+                let mut pin_info = BLUETOOTH_PIN_INFO::default();
+                pin_info.pin[..4].copy_from_slice(b"0000");
+                pin_info.pinLength = 4;
+                response.Anonymous = BLUETOOTH_AUTHENTICATE_RESPONSE_0 { pinInfo: pin_info };
+            }
+            _ => {}
+        }
+
+        let send_result = BluetoothSendAuthenticationResponseEx(None, &response);
+        if send_result != ERROR_SUCCESS.0 {
+            warn!(
+                "BluetoothSendAuthenticationResponseEx failed: {} (method {:?})",
+                send_result, params.authenticationMethod
+            );
+        } else {
+            info!(
+                "Auto-confirmed pairing request (method {:?})",
+                params.authenticationMethod
+            );
+        }
+        TRUE
+    }
+
+    fn pair_device_headless(
+        device_info: &mut BLUETOOTH_DEVICE_INFO,
+        addr_str: &str,
+    ) -> Result<()> {
+        let mut reg_handle: isize = 0;
+        let reg_result = unsafe {
+            BluetoothRegisterForAuthenticationEx(
+                Some(device_info as *const BLUETOOTH_DEVICE_INFO),
+                &mut reg_handle,
+                Some(auto_accept_auth_callback),
+                None,
+            )
+        };
+        if reg_result != ERROR_SUCCESS.0 {
+            warn!(
+                "BluetoothRegisterForAuthenticationEx failed for {} (error {}); pairing may fall back to the system wizard",
+                addr_str, reg_result
+            );
+        }
+
+        let auth_result = unsafe {
+            BluetoothAuthenticateDeviceEx(
+                None,
+                None,
+                device_info,
+                None,
+                MITMProtectionNotRequired,
+            )
+        };
+
+        if reg_result == ERROR_SUCCESS.0 {
+            if let Err(e) = unsafe { BluetoothUnregisterAuthentication(reg_handle) } {
+                warn!("BluetoothUnregisterAuthentication failed: {:?}", e);
+            }
+        }
+
+        if auth_result == ERROR_SUCCESS.0 || auth_result == ERROR_NO_MORE_ITEMS.0 {
+            info!(
+                "Headless pairing finished for {} (result {})",
+                addr_str, auth_result
+            );
+            thread::sleep(Duration::from_millis(500));
+            let refresh_result = unsafe { BluetoothGetDeviceInfo(None, device_info) };
+            if refresh_result != ERROR_SUCCESS.0 {
+                warn!(
+                    "BluetoothGetDeviceInfo refresh after pairing for {} failed: {}",
+                    addr_str, refresh_result
+                );
+            }
+            Ok(())
+        } else {
+            corelib::bail_site!(
+                "BluetoothAuthenticateDeviceEx failed for {}: {}",
+                addr_str,
+                auth_result
+            );
+        }
     }
 
     pub fn connect_impl(addr_str: &str) -> Result<bool> {
@@ -650,11 +853,10 @@ pub mod core {
 
         let get_device_info_err = unsafe { BluetoothGetDeviceInfo(None, &mut device_info_struct) };
         if get_device_info_err != ERROR_SUCCESS.0 {
-            warn!(
-                "BluetoothGetDeviceInfo for {} failed initially or device not remembered. Error code: {}. This is expected for unbonded devices.",
+            debug!(
+                "BluetoothGetDeviceInfo for {} failed (code {}); device not remembered by Windows, proceeding with direct connect",
                 addr_str, get_device_info_err
             );
-            device_info_struct.fAuthenticated = FALSE;
         } else {
             info!(
                 "Device {} name: '{}', authenticated: {}",
@@ -664,102 +866,38 @@ pub mod core {
             );
         }
 
-        if device_info_struct.fAuthenticated != TRUE {
-            info!(
-                "Device {} is not authenticated (paired). Attempting to pair now...",
-                addr_str
-            );
-            let auth_result = unsafe {
-                BluetoothAuthenticateDeviceEx(
-                    None,
-                    None,
-                    &mut device_info_struct,
-                    None,
-                    MITMProtectionNotRequired,
-                )
-            };
+        // 直连优先,不做预配对:小米穿戴的 SPP 通道不要求经典蓝牙鉴权(鉴权在厂商协议层),
+        // 抢先 BluetoothAuthenticateDeviceEx 只会拉起系统配对向导并留下配不完的认证事务。
+        let mut connect_outcome =
+            try_connect_sequence(target_bth_addr, addr_str, &fallback_channels);
 
-            if auth_result == ERROR_SUCCESS.0 {
-                info!(
-                    "BluetoothAuthenticateDeviceEx call returned ERROR_SUCCESS for {}. Device should now be authenticated (paired). fAuthenticated flag is: {}",
-                    addr_str,
-                    device_info_struct.fAuthenticated == TRUE
-                );
-                if device_info_struct.fAuthenticated != TRUE {
-                    warn!(
-                        "Device {} pairing initiated by BluetoothAuthenticateDeviceEx, but fAuthenticated is still false. Pairing might be in progress or require further action.",
-                        addr_str
-                    );
-                }
-                thread::sleep(Duration::from_millis(800));
-                let refresh_result =
-                    unsafe { BluetoothGetDeviceInfo(None, &mut device_info_struct) };
-                if refresh_result != ERROR_SUCCESS.0 {
-                    warn!(
-                        "BluetoothGetDeviceInfo refresh after pairing for {} failed. Error code: {}.",
-                        addr_str, refresh_result
-                    );
-                }
-            } else {
+        if let Err(ref failure) = connect_outcome {
+            if failure.auth_required {
                 warn!(
-                    "BluetoothAuthenticateDeviceEx call failed for {}. Error code: {}. Pairing may require user interaction or failed. Connection attempt will proceed.",
-                    addr_str, auth_result
+                    "Peer {} requires authentication (WSAEACCES); pairing headlessly and retrying",
+                    addr_str
                 );
-            }
-        }
-
-        let mut sock_opt = None;
-        let mut last_error: Option<anyhow::Error> = None;
-        for attempt in 1..=SPP_UUID_CONNECT_RETRY_COUNT {
-            match attempt_connect(target_bth_addr, Some(SPP_SERVICE_CLASS_UUID), None) {
-                Ok(sock) => {
-                    sock_opt = Some(sock);
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        "SPP Service UUID attempt {}/{} failed for {}: {:?}",
-                        attempt, SPP_UUID_CONNECT_RETRY_COUNT, addr_str, e
+                if device_info_struct.fAuthenticated == TRUE {
+                    // 已有绑定却被拒 => 绑定已失效(常见于手表侧清了配对),移除后重配
+                    let remove_result =
+                        unsafe { BluetoothRemoveDevice(&device_info_struct.Address) };
+                    info!(
+                        "Removed stale bond for {} (result {})",
+                        addr_str, remove_result
                     );
-                    last_error = Some(e);
-                    if attempt < SPP_UUID_CONNECT_RETRY_COUNT {
-                        thread::sleep(Duration::from_millis(250 * attempt as u64));
-                    }
                 }
+                if let Err(e) = pair_device_headless(&mut device_info_struct, addr_str) {
+                    warn!("Headless pairing failed for {}: {:?}", addr_str, e);
+                }
+                connect_outcome = try_connect_sequence(target_bth_addr, addr_str, &fallback_channels);
             }
         }
 
-        if sock_opt.is_none() {
-            info!(
-                "Windows RFCOMM fallback channel attempt order for {}: {:?}",
-                addr_str, fallback_channels
-            );
-            for channel in fallback_channels {
-                warn!(
-                    "Trying RFCOMM channel {} for {} after SPP UUID failure...",
-                    channel, addr_str
-                );
-                match attempt_connect(target_bth_addr, None, Some(channel as u32)) {
-                    Ok(sock) => {
-                        sock_opt = Some(sock);
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "RFCOMM Channel {} failed for {}: {:?}",
-                            channel, addr_str, e
-                        );
-                        last_error = Some(e);
-                    }
-                }
-            }
-        }
-
-        let sock = sock_opt.ok_or_else(|| {
+        let sock = connect_outcome.map_err(|failure| {
             corelib::anyhow_site!(
                 "SPP Service UUID and fallback RFCOMM channels failed for {}: {:?}",
                 addr_str,
-                last_error
+                failure.last_error
             )
         })?;
         info!("SPP Connection successful to {}", addr_str);
@@ -1028,7 +1166,19 @@ pub mod core {
             if sent > 0 {
                 total_sent += sent as usize;
             } else {
-                corelib::bail_site!("send failed with error: {}", unsafe { WSAGetLastError().0 });
+                let err_code = unsafe { WSAGetLastError().0 };
+                // 发送失败(含 SO_SNDTIMEO 超时)后套接字状态不可靠;
+                // shutdown 让读线程从 recv 返回并执行完整断开清理,上层立即感知
+                unsafe {
+                    let _ = shutdown(socket, SD_BOTH);
+                }
+                if err_code == WSAETIMEDOUT.0 {
+                    corelib::bail_site!(
+                        "send timed out after {}ms; connection torn down",
+                        SPP_SEND_TIMEOUT_MS
+                    );
+                }
+                corelib::bail_site!("send failed with error {}; connection torn down", err_code);
             }
         }
         Ok(())
