@@ -156,6 +156,9 @@ struct GlobalState {
     is_scanning: bool,
     scan_stop_event: Option<Arc<OwnedHandle>>,
     scan_thread_handle: Option<thread::JoinHandle<()>>,
+    // 每次 start/stop 扫描递增;旧扫描线程退出晚(inquiry 不可中断),
+    // 用它识别并丢弃过期线程对状态的写入
+    scan_generation: u64,
     connected_device_info: Option<SPPDevice>,
     connection_handles: Option<ConnectedThreadHandles>,
     next_connection_id: u64,
@@ -171,6 +174,7 @@ impl GlobalState {
             is_scanning: false,
             scan_stop_event: None,
             scan_thread_handle: None,
+            scan_generation: 0,
             connected_device_info: None,
             connection_handles: None,
             next_connection_id: 1,
@@ -210,6 +214,7 @@ pub mod core {
         state: &Arc<Mutex<GlobalState>>,
         device_info: &BLUETOOTH_DEVICE_INFO,
         log_prefix: &str,
+        generation: u64,
     ) {
         let name_str = string_from_utf16_char_array(&device_info.szName);
         let address_str = bth_addr_to_string(unsafe { device_info.Address.Anonymous.ullLong });
@@ -228,6 +233,13 @@ pub mod core {
         };
         match state.lock() {
             Ok(mut state_w) => {
+                if state_w.scan_generation != generation {
+                    debug!(
+                        "Dropping device {} from stale scan thread (gen {} != {})",
+                        dev.address, generation, state_w.scan_generation
+                    );
+                    return;
+                }
                 if !state_w
                     .scanned_devices
                     .iter()
@@ -239,6 +251,17 @@ pub mod core {
             }
             Err(_) => warn!("Failed to lock BT_STATE to remember scanned device"),
         }
+    }
+
+    // BluetoothFindFirstDevice 的 inquiry 是不可中断的阻塞调用(数秒起),
+    // 在调用方线程 join 会把同步 tauri command 所在的主线程卡住,后台收尸
+    fn reap_scan_thread(handle: thread::JoinHandle<()>) {
+        thread::spawn(move || {
+            handle
+                .join()
+                .unwrap_or_else(|e| warn!("Scan thread join error: {:?}", e));
+            debug!("Scan thread reaped in background");
+        });
     }
 
     fn init_winsock_if_needed() -> Result<()> {
@@ -326,6 +349,7 @@ pub mod core {
             let scan_thread_handle_opt = state.scan_thread_handle.take();
             let scan_stop_event_opt = if state.is_scanning || scan_thread_handle_opt.is_some() {
                 state.is_scanning = false;
+                state.scan_generation = state.scan_generation.wrapping_add(1);
                 state.scan_stop_event.take()
             } else {
                 None
@@ -352,9 +376,8 @@ pub mod core {
             }
         }
         if let Some(handle) = scan_thread_handle_opt {
-            handle
-                .join()
-                .unwrap_or_else(|e| warn!("Scan thread join error on cleanup: {:?}", e));
+            // 扫描线程不碰 winsock,后台收尸不影响下面的 WSACleanup
+            reap_scan_thread(handle);
         }
         finish_disconnect(disconnected_opt);
         if need_wsa_cleanup {
@@ -380,6 +403,8 @@ pub mod core {
         let stop_event_handle = create_manual_reset_event()?;
         state_guard.scan_stop_event = Some(Arc::clone(&stop_event_handle));
         state_guard.is_scanning = true;
+        state_guard.scan_generation = state_guard.scan_generation.wrapping_add(1);
+        let scan_generation = state_guard.scan_generation;
 
         let stop_event_for_thread = Arc::clone(&stop_event_handle);
 
@@ -454,6 +479,7 @@ pub mod core {
                     &state_clone_for_thread,
                     &device_info,
                     "Continuous scan found",
+                    scan_generation,
                 );
 
                 'inner_device_loop: loop {
@@ -474,6 +500,7 @@ pub mod core {
                                 &state_clone_for_thread,
                                 &device_info,
                                 "Continuous scan found next",
+                                scan_generation,
                             );
                         }
                         Err(e) => {
@@ -504,7 +531,9 @@ pub mod core {
 
             info!("Continuous Bluetooth device scan thread finished.");
             if let Ok(mut state_w) = state_clone_for_thread.lock() {
-                state_w.is_scanning = false;
+                if state_w.scan_generation == scan_generation {
+                    state_w.is_scanning = false;
+                }
             } else {
                 warn!("Failed to lock BT_STATE when scan thread finished");
             }
@@ -513,6 +542,15 @@ pub mod core {
     }
 
     pub fn stop_scan_impl() -> Result<()> {
+        stop_scan_inner(false)
+    }
+
+    // 连接前用:inquiry 会严重挤占 RFCOMM 链路,必须等扫描线程真正退出再连
+    fn stop_scan_and_wait() -> Result<()> {
+        stop_scan_inner(true)
+    }
+
+    fn stop_scan_inner(wait: bool) -> Result<()> {
         let (stop_event_opt, thread_handle_opt) = {
             let mut state = BT_STATE
                 .lock()
@@ -525,6 +563,7 @@ pub mod core {
             let stop_evt = state.scan_stop_event.take();
             let th_handle = state.scan_thread_handle.take();
             state.is_scanning = false;
+            state.scan_generation = state.scan_generation.wrapping_add(1);
             (stop_evt, th_handle)
         };
 
@@ -534,11 +573,15 @@ pub mod core {
         }
 
         if let Some(handle) = thread_handle_opt {
-            info!("Waiting for scan thread to join...");
-            handle
-                .join()
-                .map_err(|e| corelib::anyhow_site!("Failed to join scan thread: {:?}", e))?;
-            info!("Scan thread joined successfully.");
+            if wait {
+                info!("Waiting for scan thread to join...");
+                handle
+                    .join()
+                    .map_err(|e| corelib::anyhow_site!("Failed to join scan thread: {:?}", e))?;
+                info!("Scan thread joined successfully.");
+            } else {
+                reap_scan_thread(handle);
+            }
         }
 
         Ok(())
@@ -821,7 +864,7 @@ pub mod core {
         fallback_channels: &[u8],
     ) -> Result<bool> {
         init_winsock_if_needed()?;
-        stop_scan_impl()?;
+        stop_scan_and_wait()?;
         let fallback_channels = normalized_fallback_channels(fallback_channels);
 
         let old_connection_opt = {
