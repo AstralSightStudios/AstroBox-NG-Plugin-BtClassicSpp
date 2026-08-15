@@ -84,7 +84,6 @@ static SHARED_BT_STATE: Lazy<Arc<Mutex<SharedState>>> =
 
 const RFCOMM_ASYNC_SEND_TIMEOUT: Duration = Duration::from_secs(45);
 const RFCOMM_ASYNC_MAX_IN_FLIGHT: usize = 24;
-const RFCOMM_ASYNC_PUMP_DELAY: Duration = Duration::from_millis(1);
 const KIORETURN_BUSY: i32 = 0xE00002D5u32 as i32;
 const KIORETURN_NOSPACE: i32 = 0xE00002DBu32 as i32;
 const KIORETURN_UNDERRUN: i32 = 0xE00002E7u32 as i32;
@@ -127,79 +126,77 @@ fn cancel_pending_rfcomm_send() {
     });
 }
 
-fn schedule_pending_rfcomm_send() {
-    Queue::main().exec_after(RFCOMM_ASYNC_PUMP_DELAY, || {
-        let chan = MAIN_THREAD_STATE.with(|cell| cell.borrow().rfcomm_channel.clone());
-        if let Some(chan) = chan {
-            pump_pending_rfcomm_send(&chan);
-        }
-    });
-}
-
 fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
-    enum Action {
-        Submitted,
-        Complete,
-        Fail(String),
-        Noop,
-    }
-
-    let action = MAIN_THREAD_STATE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        let Some(pending) = state.pending_send.as_mut() else {
-            return Action::Noop;
-        };
-
-        if pending.in_flight >= RFCOMM_ASYNC_MAX_IN_FLIGHT {
-            return Action::Noop;
+    loop {
+        enum Action {
+            Continue,
+            Wait,
+            Complete,
+            Fail(String),
+            Noop,
         }
 
-        if pending.next_chunk_idx >= pending.chunks.len() {
-            if pending.in_flight == 0 {
-                return Action::Complete;
+        let action = MAIN_THREAD_STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            let Some(pending) = state.pending_send.as_mut() else {
+                return Action::Noop;
+            };
+
+            if pending.in_flight >= RFCOMM_ASYNC_MAX_IN_FLIGHT {
+                return Action::Wait;
             }
-            return Action::Noop;
-        }
 
-        if unsafe { chan.isTransmissionPaused() } {
-            return Action::Noop;
-        }
+            if pending.next_chunk_idx >= pending.chunks.len() {
+                if pending.in_flight == 0 {
+                    return Action::Complete;
+                }
+                return Action::Wait;
+            }
 
-        let chunk = &pending.chunks[pending.next_chunk_idx];
-        let ret = unsafe {
-            chan.writeAsync_length_refcon(
-                chunk.as_ptr() as *mut c_void,
-                chunk.len() as u16,
-                std::ptr::null_mut(),
-            )
-        };
+            if unsafe { chan.isTransmissionPaused() } {
+                return Action::Wait;
+            }
 
-        if ret == kIOReturnSuccess {
-            pending.next_chunk_idx += 1;
-            pending.in_flight += 1;
-            Action::Submitted
-        } else if is_retryable_rfcomm_backpressure(ret) {
-            Action::Noop
-        } else {
-            let mtu = unsafe { chan.getMTU() as usize }.max(1);
-            Action::Fail(format!(
-                "Failed to queue data via write_async, error code: {}, next_chunk_len={}, mtu={}, next_chunk_idx={}, total_chunks={}",
-                ret,
-                chunk.len(),
-                mtu,
-                pending.next_chunk_idx,
-                pending.chunks.len()
-            ))
-        }
-    });
+            let chunk = &pending.chunks[pending.next_chunk_idx];
+            let ret = unsafe {
+                chan.writeAsync_length_refcon(
+                    chunk.as_ptr() as *mut c_void,
+                    chunk.len() as u16,
+                    std::ptr::null_mut(),
+                )
+            };
 
-    match action {
-        Action::Submitted => schedule_pending_rfcomm_send(),
-        Action::Complete => complete_pending_rfcomm_send(Ok(())),
-        Action::Fail(err) => {
-            complete_pending_rfcomm_send(Err(corelib::anyhow_site!("{}", err)));
+            if ret == kIOReturnSuccess {
+                pending.next_chunk_idx += 1;
+                pending.in_flight += 1;
+                Action::Continue
+            } else if is_retryable_rfcomm_backpressure(ret) {
+                Action::Wait
+            } else {
+                let mtu = unsafe { chan.getMTU() as usize }.max(1);
+                Action::Fail(format!(
+                    "Failed to queue data via write_async, error code: {}, next_chunk_len={}, mtu={}, next_chunk_idx={}, total_chunks={}",
+                    ret,
+                    chunk.len(),
+                    mtu,
+                    pending.next_chunk_idx,
+                    pending.chunks.len()
+                ))
+            }
+        });
+
+        match action {
+            Action::Continue => continue,
+            Action::Wait | Action::Noop => break,
+            Action::Complete => {
+                complete_pending_rfcomm_send(Ok(()));
+                break;
+            }
+            Action::Fail(err) => {
+                complete_pending_rfcomm_send(Err(corelib::anyhow_site!("{}", err)));
+                break;
+            }
         }
-        Action::Noop => {}
     }
 }
 
