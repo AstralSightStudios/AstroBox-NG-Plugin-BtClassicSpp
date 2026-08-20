@@ -6,6 +6,7 @@ use bluer::rfcomm::{Profile, ReqError, Role, SocketAddr, Stream};
 use bluer::{Adapter, AdapterEvent, Address, DiscoveryFilter, DiscoveryTransport, Session, Uuid};
 use futures_util::stream::StreamExt;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,17 +25,25 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 
 const SPP_SERVICE_UUID: &str = "00001101-0000-1000-8000-00805f9b34fb";
 
+struct DeviceConnection {
+    socket_stream: Arc<Mutex<Stream>>,
+    read_stop: Option<Arc<AtomicBool>>,
+    read_thread: Option<JoinHandle<()>>,
+    connected_device_info: SPPDevice,
+    on_connected_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    data_listener_callback: Option<Arc<Mutex<Box<dyn FnMut(Result<Vec<u8>, String>) + Send>>>>,
+}
+
 struct GlobalState {
     adapter: Option<Adapter>,
     scanned_devices: Vec<SPPDevice>,
     scan_stop: Option<Arc<AtomicBool>>,
     scan_thread: Option<JoinHandle<()>>,
-    socket_stream: Option<Arc<Mutex<Stream>>>,
-    read_stop: Option<Arc<AtomicBool>>,
-    read_thread: Option<JoinHandle<()>>,
-    connected_device_info: Option<SPPDevice>,
-    on_connected_callback: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
-    data_listener_callback: Option<Arc<Mutex<Box<dyn FnMut(Result<Vec<u8>, String>) + Send>>>>,
+    connections: HashMap<String, DeviceConnection>,
+    // Callbacks may be registered before the corresponding connection exists.
+    on_connected_callbacks: HashMap<String, Arc<dyn Fn() + Send + Sync + 'static>>,
+    data_listener_callbacks:
+        HashMap<String, Arc<Mutex<Box<dyn FnMut(Result<Vec<u8>, String>) + Send>>>>,
 }
 
 impl GlobalState {
@@ -72,12 +81,9 @@ impl GlobalState {
                 scanned_devices: Vec::new(),
                 scan_stop: None,
                 scan_thread: None,
-                socket_stream: None,
-                read_stop: None,
-                read_thread: None,
-                connected_device_info: None,
-                on_connected_callback: None,
-                data_listener_callback: None,
+                connections: HashMap::new(),
+                on_connected_callbacks: HashMap::new(),
+                data_listener_callbacks: HashMap::new(),
             }
         })
     }
@@ -274,27 +280,41 @@ pub mod core {
         Ok(st.scanned_devices.clone())
     }
 
-    pub fn connect_impl(addr_str: &str) -> Result<bool> {
-        connect_impl_with_fallback_channels(addr_str, &[5, 1])
+    fn normalize_addr(addr_str: &str) -> Result<(String, Address)> {
+        let addr: Address = addr_str
+            .parse()
+            .map_err(|e| corelib::anyhow_site!("Invalid address format: {}", e))?;
+        Ok((addr.to_string(), addr))
     }
 
-    pub fn connect_impl_with_fallback_channels(
-        addr_str: &str,
-        fallback_channels: &[u8],
-    ) -> Result<bool> {
-        stop_scan_impl()?;
-        disconnect_impl()?;
+    fn stop_connection(connection: DeviceConnection) {
+        if let Some(flag) = connection.read_stop {
+            flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(thread) = connection.read_thread {
+            thread.abort();
+        }
+        // Dropping the stream closes the RFCOMM connection.
+        drop(connection.socket_stream);
+    }
 
-        let addr_clone = addr_str.to_string();
+    pub fn connect_impl(addr_str: &str, fallback_channels: &[u8]) -> Result<bool> {
+        stop_scan_impl()?;
+        let (addr_key, addr) = normalize_addr(addr_str)?;
+        // Reconnecting one address must not affect any other address. Keep
+        // callbacks registered for this upcoming connection; the public
+        // disconnect_impl intentionally clears them.
+        let old_connection = {
+            let mut st = STATE.lock().unwrap();
+            st.connections.remove(&addr_key)
+        };
+        if let Some(old_connection) = old_connection {
+            stop_connection(old_connection);
+        }
         let fallback_channels = normalized_fallback_channels(fallback_channels);
 
-        // 修复：使用 block_in_place，并让其闭包返回 Result
         tokio::task::block_in_place(|| {
             RUNTIME.block_on(async move {
-                let addr: Address = addr_clone
-                    .parse()
-                    .map_err(|e| corelib::anyhow_site!("Invalid address format: {}", e))?;
-
                 let mut stream: Option<Stream> = None;
                 let mut last_error: Option<anyhow::Error> = None;
 
@@ -349,86 +369,121 @@ pub mod core {
                     }
                 }
 
-                if let Some(connected_stream) = stream {
-                    let socket_arc = Arc::new(Mutex::new(connected_stream));
-                    let cb_opt = {
-                        let mut name: Option<String> = None;
-                        let mut st = STATE.lock().unwrap();
-                        if let Some(adapter) = st.adapter.clone() {
-                            if let Ok(device) = adapter.device(addr) {
-                                name = device.name().await.unwrap_or(None)
-                            }
-                        }
-                        st.socket_stream = Some(socket_arc.clone());
-                        st.connected_device_info = Some(SPPDevice {
-                            name,
-                            address: addr_clone,
-                        });
-                        st.on_connected_callback.clone()
-                    };
-                    if let Some(cb) = cb_opt {
-                        cb();
-                    }
-                    Ok(true)
-                } else {
-                    Err(corelib::anyhow_site!(
+                let connected_stream = stream.ok_or_else(|| {
+                    corelib::anyhow_site!(
                         "Failed to connect through SPP UUID or fallback channels: {:?}",
                         last_error
-                    ))
+                    )
+                })?;
+                let socket_arc = Arc::new(Mutex::new(connected_stream));
+
+                // Fetch the name without holding the synchronous state lock over an await.
+                let adapter = STATE.lock().unwrap().adapter.clone();
+                let name = if let Some(adapter) = adapter {
+                    match adapter.device(addr) {
+                        Ok(device) => device.name().await.unwrap_or(None),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let callback = {
+                    let mut st = STATE.lock().unwrap();
+                    let connection = DeviceConnection {
+                        socket_stream: socket_arc,
+                        read_stop: None,
+                        read_thread: None,
+                        connected_device_info: SPPDevice {
+                            name,
+                            address: addr_key.clone(),
+                        },
+                        on_connected_callback: st.on_connected_callbacks.remove(&addr_key),
+                        data_listener_callback: st.data_listener_callbacks.remove(&addr_key),
+                    };
+                    let callback = connection.on_connected_callback.clone();
+                    st.connections.insert(addr_key, connection);
+                    callback
+                };
+                if let Some(callback) = callback {
+                    callback();
                 }
+                Ok(true)
             })
         })
     }
 
-    pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
+    pub fn get_connected_device_info_impl(addr: &str) -> Result<Option<SPPDevice>> {
+        let (addr_key, _) = normalize_addr(addr)?;
         let st = STATE.lock().unwrap();
-        Ok(st.connected_device_info.clone())
+        Ok(st
+            .connections
+            .get(&addr_key)
+            .map(|connection| connection.connected_device_info.clone()))
     }
 
-    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
+    pub fn get_max_send_len_impl(_addr: &str) -> Result<Option<usize>> {
+        // Linux RFCOMM does not expose a useful fixed application payload limit.
         Ok(None)
     }
 
-    pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+    pub fn on_connected_impl(addr: &str, cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+        let (addr_key, _) = normalize_addr(addr)?;
+        let callback: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(cb);
         let should_call = {
-            let st = STATE.lock().unwrap();
-            st.connected_device_info.is_some()
+            let mut st = STATE.lock().unwrap();
+            if let Some(connection) = st.connections.get_mut(&addr_key) {
+                connection.on_connected_callback = Some(callback.clone());
+                true
+            } else {
+                st.on_connected_callbacks.insert(addr_key, callback.clone());
+                false
+            }
         };
         if should_call {
-            cb();
+            callback();
         }
-        let mut st = STATE.lock().unwrap();
-        st.on_connected_callback = Some(Arc::new(cb));
         Ok(())
     }
 
     pub fn set_data_listener_impl(
+        addr: &str,
         cb: Box<dyn FnMut(Result<Vec<u8>, String>) + Send + 'static>,
     ) -> Result<()> {
+        let (addr_key, _) = normalize_addr(addr)?;
+        let callback = Arc::new(Mutex::new(cb));
         let mut st = STATE.lock().unwrap();
-        st.data_listener_callback = Some(Arc::new(Mutex::new(cb)));
+        if let Some(connection) = st.connections.get_mut(&addr_key) {
+            connection.data_listener_callback = Some(callback);
+        } else {
+            st.data_listener_callbacks.insert(addr_key, callback);
+        }
         Ok(())
     }
 
-    pub fn start_subscription_impl() -> Result<()> {
+    pub fn start_subscription_impl(addr: &str) -> Result<()> {
+        let (addr_key, _) = normalize_addr(addr)?;
         let (socket_arc, cb_arc, stop_flag) = {
             let mut st = STATE.lock().unwrap();
-            if st.read_thread.is_some() {
+            let connection = st
+                .connections
+                .get_mut(&addr_key)
+                .ok_or_else(|| corelib::anyhow_site!("Not connected"))?;
+            if connection.read_thread.is_some() {
                 return Ok(());
             }
-            let sock = st
-                .socket_stream
-                .clone()
-                .ok_or_else(|| corelib::anyhow_site!("Not connected"))?;
-            let cb = st
+            let cb = connection
                 .data_listener_callback
                 .clone()
                 .ok_or_else(|| corelib::anyhow_site!("Data listener not set"))?;
             let flag = Arc::new(AtomicBool::new(false));
-            st.read_stop = Some(flag.clone());
-            (sock, cb, flag)
+            connection.read_stop = Some(flag.clone());
+            (connection.socket_stream.clone(), cb, flag)
         };
 
+        let socket_for_task = socket_arc.clone();
+        let state_clone = STATE.clone();
+        let addr_for_task = addr_key.clone();
         let handle = RUNTIME.spawn(async move {
             let mut buf = [0u8; 1024];
             while !stop_flag.load(Ordering::SeqCst) {
@@ -439,7 +494,7 @@ pub mod core {
                     read_res = sock_lock.read(&mut buf) => {
                         match read_res {
                             Ok(0) => {
-                                log::info!("Connection closed by peer.");
+                                log::info!("Connection {} closed by peer.", addr_for_task);
                                 let mut f = cb_arc.lock().await;
                                 f(Err("Connection closed".into()));
                                 break;
@@ -450,7 +505,7 @@ pub mod core {
                                 f(Ok(data));
                             }
                             Err(e) => {
-                                log::error!("Socket read error: {}", e);
+                                log::error!("Socket read error for {}: {}", addr_for_task, e);
                                 let mut f = cb_arc.lock().await;
                                 f(Err(e.to_string()));
                                 break;
@@ -459,23 +514,40 @@ pub mod core {
                     }
                 }
             }
+
+            // Do not let a completed reader prevent a later subscription.  The
+            // pointer check prevents an old reader from touching a replacement
+            // connection for the same address.
+            let mut st = state_clone.lock().unwrap();
+            if let Some(connection) = st.connections.get_mut(&addr_for_task) {
+                if Arc::ptr_eq(&connection.socket_stream, &socket_for_task) {
+                    connection.read_thread = None;
+                    connection.read_stop = None;
+                }
+            }
         });
 
         let mut st = STATE.lock().unwrap();
-        st.read_thread = Some(handle);
-        Ok(())
+        if let Some(connection) = st.connections.get_mut(&addr_key) {
+            connection.read_thread = Some(handle);
+            Ok(())
+        } else {
+            handle.abort();
+            Err(corelib::anyhow_site!("Connection was closed"))
+        }
     }
 
-    pub fn send_impl(data: &[u8]) -> Result<()> {
+    pub fn send_impl(addr: &str, data: &[u8]) -> Result<()> {
+        let (addr_key, _) = normalize_addr(addr)?;
         let socket_arc = {
             let st = STATE.lock().unwrap();
-            st.socket_stream
-                .clone()
+            st.connections
+                .get(&addr_key)
+                .map(|connection| connection.socket_stream.clone())
                 .ok_or_else(|| corelib::anyhow_site!("Not connected"))?
         };
         let data_clone = data.to_vec();
 
-        // 修复：使用 block_in_place，并让其闭包返回 Result
         tokio::task::block_in_place(|| {
             RUNTIME.block_on(async {
                 let mut sock = socket_arc.lock().await;
@@ -486,22 +558,33 @@ pub mod core {
         })
     }
 
-    pub fn disconnect_impl() -> Result<()> {
-        let (socket_opt, stop_opt, thread_opt) = {
+    pub fn disconnect_impl(addr: &str) -> Result<()> {
+        let (addr_key, _) = normalize_addr(addr)?;
+        let connection = {
             let mut st = STATE.lock().unwrap();
-            let s = st.socket_stream.take();
-            let stop = st.read_stop.take();
-            let th = st.read_thread.take();
-            st.connected_device_info = None;
-            (s, stop, th)
+            st.on_connected_callbacks.remove(&addr_key);
+            st.data_listener_callbacks.remove(&addr_key);
+            st.connections.remove(&addr_key)
         };
-        if let Some(flag) = stop_opt {
-            flag.store(true, Ordering::SeqCst);
+        if let Some(connection) = connection {
+            stop_connection(connection);
         }
-        if let Some(h) = thread_opt {
-            h.abort();
+        Ok(())
+    }
+
+    pub fn disconnect_all_impl() -> Result<()> {
+        let connections = {
+            let mut st = STATE.lock().unwrap();
+            st.on_connected_callbacks.clear();
+            st.data_listener_callbacks.clear();
+            st.connections
+                .drain()
+                .map(|(_, connection)| connection)
+                .collect::<Vec<_>>()
+        };
+        for connection in connections {
+            stop_connection(connection);
         }
-        drop(socket_opt);
         Ok(())
     }
 }

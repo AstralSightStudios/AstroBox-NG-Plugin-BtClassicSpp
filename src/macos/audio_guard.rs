@@ -13,6 +13,7 @@
 
 use objc2_core_foundation::{CFRetained, CFString};
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
 use std::sync::Mutex;
@@ -85,8 +86,7 @@ extern "C" {
     ) -> OSStatus;
 }
 
-struct GuardState {
-    active: bool,
+struct GuardTarget {
     /// 目标手表的 MAC（仅保留十六进制大写，无分隔符）。
     watch_mac_hex: String,
     /// 目标手表名称（UID 命中失败时退化匹配）。
@@ -95,12 +95,16 @@ struct GuardState {
     preferred: AudioDeviceID,
 }
 
+struct GuardState {
+    /// The CoreAudio listener is global, while its targets are per address.
+    active: bool,
+    targets: HashMap<String, GuardTarget>,
+}
+
 static GUARD: Lazy<Mutex<GuardState>> = Lazy::new(|| {
     Mutex::new(GuardState {
         active: false,
-        watch_mac_hex: String::new(),
-        watch_name: None,
-        preferred: 0,
+        targets: HashMap::new(),
     })
 });
 
@@ -247,56 +251,73 @@ unsafe extern "C" fn default_output_changed(
     _in_addresses: *const AudioObjectPropertyAddress,
     _in_client_data: *mut c_void,
 ) -> OSStatus {
-    let (active, mac, name, preferred) = match GUARD.lock() {
-        Ok(g) => (
-            g.active,
-            g.watch_mac_hex.clone(),
-            g.watch_name.clone(),
-            g.preferred,
-        ),
-        Err(_) => return 0,
+    let targets = match GUARD.lock() {
+        Ok(g) if g.active => g
+            .targets
+            .values()
+            .map(|target| {
+                (
+                    target.watch_mac_hex.clone(),
+                    target.watch_name.clone(),
+                    target.preferred,
+                )
+            })
+            .collect::<Vec<_>>(),
+        _ => return 0,
     };
-    if !active {
+    if targets.is_empty() {
         return 0;
     }
 
     let current = get_default_output();
-    if !is_watch_device(current, &mac, &name) {
-        return 0;
-    }
-
-    if preferred != 0 && preferred != current && !is_watch_device(preferred, &mac, &name) {
-        if set_default_output(preferred) {
-            log::info!("audio_guard: 手表抢占了默认输出，已切回设备 {}", preferred);
-        } else {
-            log::warn!(
-                "audio_guard: 尝试切回默认输出失败 (preferred={})",
-                preferred
-            );
+    // Any connected watch may trigger the listener.  Try the matching watch's
+    // own preferred output, never the state of whichever device connected last.
+    for (mac, name, preferred) in targets {
+        if !is_watch_device(current, &mac, &name) {
+            continue;
         }
-    } else {
-        log::warn!("audio_guard: 手表抢占了默认输出，但没有可恢复的目标设备");
+        if preferred != 0 && preferred != current && !is_watch_device(preferred, &mac, &name) {
+            if set_default_output(preferred) {
+                log::info!("audio_guard: 手表抢占了默认输出，已切回设备 {}", preferred);
+            } else {
+                log::warn!(
+                    "audio_guard: 尝试切回默认输出失败 (preferred={})",
+                    preferred
+                );
+            }
+        } else {
+            log::warn!("audio_guard: 手表抢占了默认输出，但没有可恢复的目标设备");
+        }
+        break;
     }
     0
 }
 
-/// 开始守护：记录连接前的默认输出，并注册监听。可重复调用（更新目标）。
+/// 开始守护：记录连接前的默认输出，并注册监听。每个地址拥有独立目标。
 pub fn start(addr: &str, name: Option<String>) {
-    let mac_hex = normalize_hex(addr);
+    let addr_key = normalize_hex(addr);
+    let mac_hex = addr_key.clone();
     let current = get_default_output();
-    let current_is_watch = is_watch_device(current, &mac_hex, &name);
-
     let need_register = {
         let mut g = match GUARD.lock() {
             Ok(g) => g,
             Err(_) => return,
         };
-        g.watch_mac_hex = mac_hex.clone();
-        g.watch_name = name;
-        // 连接前的默认输出（通常是用户的耳机）作为恢复目标；若此刻已是手表则不覆盖。
-        if !current_is_watch {
-            g.preferred = current;
-        }
+        // Do not use another guarded watch as the preferred output for a new
+        // target.  This matters when two devices are connected concurrently.
+        let current_is_guarded = g
+            .targets
+            .values()
+            .any(|target| is_watch_device(current, &target.watch_mac_hex, &target.watch_name));
+        let preferred = if current_is_guarded { 0 } else { current };
+        g.targets.insert(
+            addr_key.clone(),
+            GuardTarget {
+                watch_mac_hex: mac_hex,
+                watch_name: name,
+                preferred,
+            },
+        );
         let need = !g.active;
         if need {
             g.active = true; // 先置位，避免注册成功后回调读到 active=false
@@ -305,11 +326,11 @@ pub fn start(addr: &str, name: Option<String>) {
     };
 
     if need_register {
-        let addr = prop_addr(K_PROP_DEFAULT_OUTPUT_DEVICE);
+        let prop = prop_addr(K_PROP_DEFAULT_OUTPUT_DEVICE);
         let status = unsafe {
             AudioObjectAddPropertyListener(
                 K_AUDIO_OBJECT_SYSTEM_OBJECT,
-                &addr,
+                &prop,
                 default_output_changed,
                 ptr::null_mut(),
             )
@@ -317,6 +338,7 @@ pub fn start(addr: &str, name: Option<String>) {
         if status != 0 {
             if let Ok(mut g) = GUARD.lock() {
                 g.active = false;
+                g.targets.remove(&addr_key);
             }
             log::warn!(
                 "audio_guard: AudioObjectAddPropertyListener 失败: {}",
@@ -328,37 +350,59 @@ pub fn start(addr: &str, name: Option<String>) {
     }
 }
 
-/// 停止守护：注销监听并清空状态。
-pub fn stop() {
-    let was_active = match GUARD.lock() {
+/// Stop one address's guard; other active connections remain protected.
+pub fn stop_for(addr: &str) {
+    let addr_key = normalize_hex(addr);
+    let should_stop_listener = match GUARD.lock() {
         Ok(mut g) => {
-            let a = g.active;
-            g.active = false;
-            g.preferred = 0;
-            g.watch_mac_hex.clear();
-            g.watch_name = None;
-            a
+            g.targets.remove(&addr_key);
+            if g.targets.is_empty() {
+                let was_active = g.active;
+                g.active = false;
+                was_active
+            } else {
+                false
+            }
         }
         Err(_) => return,
     };
+    if should_stop_listener {
+        remove_listener();
+    }
+}
 
-    if was_active {
-        let addr = prop_addr(K_PROP_DEFAULT_OUTPUT_DEVICE);
-        let status = unsafe {
-            AudioObjectRemovePropertyListener(
-                K_AUDIO_OBJECT_SYSTEM_OBJECT,
-                &addr,
-                default_output_changed,
-                ptr::null_mut(),
-            )
-        };
-        if status != 0 {
-            log::warn!(
-                "audio_guard: AudioObjectRemovePropertyListener 失败: {}",
-                status
-            );
-        } else {
-            log::info!("audio_guard: 已停止");
+/// Stop all guards during application shutdown.
+pub fn stop_all() {
+    let should_stop_listener = match GUARD.lock() {
+        Ok(mut g) => {
+            let was_active = g.active;
+            g.active = false;
+            g.targets.clear();
+            was_active
         }
+        Err(_) => return,
+    };
+    if should_stop_listener {
+        remove_listener();
+    }
+}
+
+fn remove_listener() {
+    let prop = prop_addr(K_PROP_DEFAULT_OUTPUT_DEVICE);
+    let status = unsafe {
+        AudioObjectRemovePropertyListener(
+            K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            &prop,
+            default_output_changed,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        log::warn!(
+            "audio_guard: AudioObjectRemovePropertyListener 失败: {}",
+            status
+        );
+    } else {
+        log::info!("audio_guard: 已停止");
     }
 }

@@ -108,7 +108,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private var sendActor: SendChannel<ByteArray>? = null
     private val pendingPool = ConcurrentLinkedQueue<ByteArray>()
 
-    private var readThread: Thread? = null
+    @Volatile private var readThread: Thread? = null
     private val uiHandler = Handler(Looper.getMainLooper())
 
     private fun requiredRuntimePermissions(): Array<String> {
@@ -426,6 +426,15 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 return@withContext false to errMsg
             }
 
+            // Reconnecting this session must not leave its old actor/read thread
+            // racing with the new socket. Other addresses use other BTSpp
+            // instances and are intentionally untouched.
+            if (socket != null || connectedDevice != null) {
+                val pendingOnConnected = onConnectedCallback
+                disconnect()
+                onConnectedCallback = pendingOnConnected
+            }
+
             val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
                 ?: return@withContext false to "BluetoothAdapter == null"
             val dev: BluetoothDevice = try {
@@ -497,7 +506,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     }
 
     fun onConnected(cb: () -> Unit) {
-        if (connectedDevice != null) {
+        if (connectedDevice != null || bleConnectedDevice != null) {
             uiHandler.post { cb() }
         } else {
             onConnectedCallback = cb
@@ -602,6 +611,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     private val bleGattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (gatt !== bleGatt) return
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     bleConnectDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
@@ -621,11 +631,13 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (gatt !== bleGatt) return
             bleServicesDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
             bleServicesDeferred = null
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (gatt !== bleGatt) return
             val acceptedMtu = if (status == BluetoothGatt.GATT_SUCCESS) mtu else BLE_DEFAULT_MTU
             bleMtu = acceptedMtu
             bleMtuDeferred?.complete(acceptedMtu)
@@ -637,6 +649,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
+            if (gatt !== bleGatt) return
             bleDescriptorWriteDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
             bleDescriptorWriteDeferred = null
         }
@@ -646,6 +659,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             gatt: BluetoothGatt,
             characteristic: BluetoothGattCharacteristic
         ) {
+            if (gatt !== bleGatt) return
             characteristic.value?.let(::emitBleData)
         }
 
@@ -654,6 +668,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray
         ) {
+            if (gatt !== bleGatt) return
             emitBleData(value)
         }
     }
@@ -749,7 +764,9 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 ?: return@withContext false to "BLE device not found: $address"
 
             adapter?.cancelDiscovery()
+            val pendingOnConnected = onConnectedCallback
             disconnectBle()
+            onConnectedCallback = pendingOnConnected
             bleManualDisconnect = false
 
             val connectedDeferred = CompletableDeferred<Boolean>()
@@ -780,6 +797,10 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             }
 
             bleConnectedDevice = dev
+            onConnectedCallback?.let { cb ->
+                uiHandler.post { cb() }
+                onConnectedCallback = null
+            }
             true to null
         } catch (e: Exception) {
             disconnectBle()
@@ -880,21 +901,38 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     fun startSubscription() {
         if (inStream == null || readThread != null) return
-        readThread = Thread {
+        val reader = Thread {
+            val currentThread = Thread.currentThread()
             val buf = ByteArray(1024)
             try {
-                while (!Thread.currentThread().isInterrupted) {
+                while (readThread === currentThread && !currentThread.isInterrupted) {
                     val len = inStream?.read(buf) ?: break
                     if (len <= 0) break
                     val bytes = buf.copyOf(len)
-                    uiHandler.post { dataListener?.onDataReceived(bytes) }
+                    if (readThread === currentThread) {
+                        uiHandler.post {
+                            if (readThread === currentThread) {
+                                dataListener?.onDataReceived(bytes)
+                            }
+                        }
+                    }
                 }
             } catch (e: IOException) {
-                uiHandler.post { dataListener?.onError(e) }
+                if (readThread === currentThread) {
+                    uiHandler.post {
+                        if (readThread === currentThread) {
+                            dataListener?.onError(e)
+                        }
+                    }
+                }
             } finally {
-                disconnect()
+                if (readThread === currentThread) {
+                    disconnect()
+                }
             }
-        }.also { it.start() }
+        }
+        readThread = reader
+        reader.start()
     }
 
     @SuppressLint("MissingPermission")
@@ -910,6 +948,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         try { outStream?.close() } catch (_: Exception) {}
         try { socket?.close() } catch (_: Exception) {}
         inStream = null; outStream = null; socket = null; connectedDevice = null
+        onConnectedCallback = null
+        dataListener = null
     }
 
     @SuppressLint("MissingPermission")
@@ -934,6 +974,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         bleNotifyCharacteristic = null
         bleServiceProbeCharacteristic = null
         bleMtu = BLE_DEFAULT_MTU
+        onConnectedCallback = null
+        dataListener = null
         bleManualDisconnect = false
     }
 

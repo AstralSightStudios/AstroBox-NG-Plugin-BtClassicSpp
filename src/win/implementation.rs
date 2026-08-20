@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -150,6 +151,24 @@ struct DisconnectedConnection {
     connection_id: u64,
 }
 
+struct PerDeviceConnection {
+    connected_device_info: Option<SPPDevice>,
+    connection_handles: Option<ConnectedThreadHandles>,
+    on_connected_callback: Option<SharedConnectedCallback>,
+    data_listener_callback: Option<SharedDataListener>,
+}
+
+impl PerDeviceConnection {
+    fn new() -> Self {
+        Self {
+            connected_device_info: None,
+            connection_handles: None,
+            on_connected_callback: None,
+            data_listener_callback: None,
+        }
+    }
+}
+
 struct GlobalState {
     wsa_initialized: bool,
     scanned_devices: Vec<SPPDevice>,
@@ -159,11 +178,8 @@ struct GlobalState {
     // 每次 start/stop 扫描递增;旧扫描线程退出晚(inquiry 不可中断),
     // 用它识别并丢弃过期线程对状态的写入
     scan_generation: u64,
-    connected_device_info: Option<SPPDevice>,
-    connection_handles: Option<ConnectedThreadHandles>,
+    connections: HashMap<String, PerDeviceConnection>,
     next_connection_id: u64,
-    on_connected_callback: Option<SharedConnectedCallback>,
-    data_listener_callback: Option<SharedDataListener>,
 }
 
 impl GlobalState {
@@ -175,11 +191,8 @@ impl GlobalState {
             scan_stop_event: None,
             scan_thread_handle: None,
             scan_generation: 0,
-            connected_device_info: None,
-            connection_handles: None,
+            connections: HashMap::new(),
             next_connection_id: 1,
-            on_connected_callback: None,
-            data_listener_callback: None,
         }
     }
 }
@@ -280,9 +293,17 @@ pub mod core {
         Ok(())
     }
 
-    fn notify_data_listener(result: Result<Vec<u8>, String>) {
+    fn notify_data_listener(addr: &str, connection_id: u64, result: Result<Vec<u8>, String>) {
         let callback = match BT_STATE.lock() {
-            Ok(state) => state.data_listener_callback.clone(),
+            Ok(state) => state.connections.get(addr).and_then(|connection| {
+                // A stale read thread must not deliver data to a replacement
+                // connection using the same address.
+                connection
+                    .connection_handles
+                    .as_ref()
+                    .filter(|handles| handles.connection_id == connection_id)
+                    .and_then(|_| connection.data_listener_callback.clone())
+            }),
             Err(_) => {
                 warn!("Failed to lock BT_STATE for data listener callback");
                 None
@@ -336,8 +357,14 @@ pub mod core {
         }
     }
 
+    fn finish_disconnects(disconnected: Vec<DisconnectedConnection>) {
+        for connection in disconnected {
+            close_disconnected_socket(connection);
+        }
+    }
+
     pub fn bluetooth_stack_cleanup() {
-        let (scan_stop_event_opt, scan_thread_handle_opt, disconnected_opt, need_wsa_cleanup) = {
+        let (scan_stop_event_opt, scan_thread_handle_opt, disconnected, need_wsa_cleanup) = {
             let mut state = match BT_STATE.lock() {
                 Ok(s) => s,
                 Err(_) => {
@@ -355,7 +382,8 @@ pub mod core {
                 None
             };
 
-            let disconnected_opt = disconnect_internal(&mut state);
+            let disconnected = disconnect_all_impl(&mut state);
+            state.connections.clear();
 
             let need_wsa_cleanup = state.wsa_initialized;
             if need_wsa_cleanup {
@@ -365,7 +393,7 @@ pub mod core {
             (
                 scan_stop_event_opt,
                 scan_thread_handle_opt,
-                disconnected_opt,
+                disconnected,
                 need_wsa_cleanup,
             )
         };
@@ -379,7 +407,7 @@ pub mod core {
             // 扫描线程不碰 winsock,后台收尸不影响下面的 WSACleanup
             reap_scan_thread(handle);
         }
-        finish_disconnect(disconnected_opt);
+        finish_disconnects(disconnected);
         if need_wsa_cleanup {
             unsafe { WSACleanup() };
             info!("WinSock cleaned up.");
@@ -732,7 +760,10 @@ pub mod core {
             match attempt_connect(target_bth_addr, None, Some(*channel as u32)) {
                 Ok(sock) => return Ok(sock),
                 Err(e) => {
-                    warn!("RFCOMM Channel {} failed for {}: {:?}", channel, addr_str, e);
+                    warn!(
+                        "RFCOMM Channel {} failed for {}: {:?}",
+                        channel, addr_str, e
+                    );
                     failure.note(e);
                 }
             }
@@ -796,10 +827,7 @@ pub mod core {
         TRUE
     }
 
-    fn pair_device_headless(
-        device_info: &mut BLUETOOTH_DEVICE_INFO,
-        addr_str: &str,
-    ) -> Result<()> {
+    fn pair_device_headless(device_info: &mut BLUETOOTH_DEVICE_INFO, addr_str: &str) -> Result<()> {
         let mut reg_handle: isize = 0;
         let reg_result = unsafe {
             BluetoothRegisterForAuthenticationEx(
@@ -817,13 +845,7 @@ pub mod core {
         }
 
         let auth_result = unsafe {
-            BluetoothAuthenticateDeviceEx(
-                None,
-                None,
-                device_info,
-                None,
-                MITMProtectionNotRequired,
-            )
+            BluetoothAuthenticateDeviceEx(None, None, device_info, None, MITMProtectionNotRequired)
         };
 
         if reg_result == ERROR_SUCCESS.0 {
@@ -855,39 +877,79 @@ pub mod core {
         }
     }
 
-    pub fn connect_impl(addr_str: &str) -> Result<bool> {
-        connect_impl_with_fallback_channels(addr_str, &[5, 1])
+    fn normalize_addr(addr: &str) -> Result<(u64, String)> {
+        let bth_addr = string_to_bth_addr(addr)?;
+        Ok((bth_addr, bth_addr_to_string(bth_addr)))
     }
 
-    pub fn connect_impl_with_fallback_channels(
-        addr_str: &str,
-        fallback_channels: &[u8],
-    ) -> Result<bool> {
+    fn is_connected(connection: &PerDeviceConnection) -> bool {
+        connection.connected_device_info.is_some() && connection.connection_handles.is_some()
+    }
+
+    fn disconnect_internal(connection: &mut PerDeviceConnection) -> Option<DisconnectedConnection> {
+        let disconnected = if let Some(handles) = connection.connection_handles.take() {
+            info!(
+                "Disconnecting connection {} socket {:?}",
+                handles.connection_id, handles.socket
+            );
+            handles.stop_flag.store(true, Ordering::Release);
+            unsafe {
+                if shutdown(handles.socket, SD_BOTH) != 0 {
+                    warn!("socket shutdown failed: {}", WSAGetLastError().0);
+                }
+            }
+            Some(DisconnectedConnection {
+                socket: handles.socket,
+                read_thread_handle: handles.read_thread_handle,
+                socket_close_lock: handles.socket_close_lock,
+                connection_id: handles.connection_id,
+            })
+        } else {
+            None
+        };
+        connection.connected_device_info = None;
+        if disconnected.is_some() {
+            info!("Disconnected.");
+        }
+        disconnected
+    }
+
+    fn disconnect_connection(
+        state: &mut GlobalState,
+        addr: &str,
+    ) -> Option<DisconnectedConnection> {
+        state
+            .connections
+            .get_mut(addr)
+            .and_then(disconnect_internal)
+    }
+
+    fn disconnect_all_impl(state: &mut GlobalState) -> Vec<DisconnectedConnection> {
+        let mut disconnected = Vec::new();
+        for connection in state.connections.values_mut() {
+            if let Some(connection) = disconnect_internal(connection) {
+                disconnected.push(connection);
+            }
+        }
+        disconnected
+    }
+
+    pub fn connect_impl(addr_str: &str, fallback_channels: &[u8]) -> Result<bool> {
+        let (target_bth_addr, addr_key) = normalize_addr(addr_str)?;
         init_winsock_if_needed()?;
         stop_scan_and_wait()?;
         let fallback_channels = normalized_fallback_channels(fallback_channels);
 
-        let old_connection_opt = {
-            let mut state = BT_STATE
+        {
+            let state = BT_STATE
                 .lock()
                 .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for connect"))?;
-
-            if let Some(ref dev_info) = state.connected_device_info {
-                if dev_info.address == addr_str {
-                    info!("Already connected to this device.");
-                    return Ok(true);
-                }
-                warn!(
-                    "Connecting to a new device, disconnecting the old one: {}",
-                    dev_info.address
-                );
+            if state.connections.get(&addr_key).is_some_and(is_connected) {
+                info!("Already connected to this device.");
+                return Ok(true);
             }
-            disconnect_internal(&mut state)
-        };
+        }
 
-        finish_disconnect(old_connection_opt);
-
-        let target_bth_addr = string_to_bth_addr(addr_str)?;
         let mut device_info_struct = BLUETOOTH_DEVICE_INFO {
             dwSize: std::mem::size_of::<BLUETOOTH_DEVICE_INFO>() as u32,
             ..Default::default()
@@ -898,12 +960,12 @@ pub mod core {
         if get_device_info_err != ERROR_SUCCESS.0 {
             debug!(
                 "BluetoothGetDeviceInfo for {} failed (code {}); device not remembered by Windows, proceeding with direct connect",
-                addr_str, get_device_info_err
+                addr_key, get_device_info_err
             );
         } else {
             info!(
                 "Device {} name: '{}', authenticated: {}",
-                addr_str,
+                addr_key,
                 string_from_utf16_char_array(&device_info_struct.szName),
                 device_info_struct.fAuthenticated == TRUE
             );
@@ -912,13 +974,13 @@ pub mod core {
         // 直连优先,不做预配对:小米穿戴的 SPP 通道不要求经典蓝牙鉴权(鉴权在厂商协议层),
         // 抢先 BluetoothAuthenticateDeviceEx 只会拉起系统配对向导并留下配不完的认证事务。
         let mut connect_outcome =
-            try_connect_sequence(target_bth_addr, addr_str, &fallback_channels);
+            try_connect_sequence(target_bth_addr, &addr_key, &fallback_channels);
 
         if let Err(ref failure) = connect_outcome {
             if failure.auth_required {
                 warn!(
                     "Peer {} requires authentication (WSAEACCES); pairing headlessly and retrying",
-                    addr_str
+                    addr_key
                 );
                 if device_info_struct.fAuthenticated == TRUE {
                     // 已有绑定却被拒 => 绑定已失效(常见于手表侧清了配对),移除后重配
@@ -926,61 +988,69 @@ pub mod core {
                         unsafe { BluetoothRemoveDevice(&device_info_struct.Address) };
                     info!(
                         "Removed stale bond for {} (result {})",
-                        addr_str, remove_result
+                        addr_key, remove_result
                     );
                 }
-                if let Err(e) = pair_device_headless(&mut device_info_struct, addr_str) {
-                    warn!("Headless pairing failed for {}: {:?}", addr_str, e);
+                if let Err(e) = pair_device_headless(&mut device_info_struct, &addr_key) {
+                    warn!("Headless pairing failed for {}: {:?}", addr_key, e);
                 }
-                connect_outcome = try_connect_sequence(target_bth_addr, addr_str, &fallback_channels);
+                connect_outcome =
+                    try_connect_sequence(target_bth_addr, &addr_key, &fallback_channels);
             }
         }
 
         let sock = connect_outcome.map_err(|failure| {
             corelib::anyhow_site!(
                 "SPP Service UUID and fallback RFCOMM channels failed for {}: {:?}",
-                addr_str,
+                addr_key,
                 failure.last_error
             )
         })?;
-        info!("SPP Connection successful to {}", addr_str);
+        info!("SPP Connection successful to {}", addr_key);
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let socket_close_lock = Arc::new(Mutex::new(()));
+        let device_info = SPPDevice {
+            name: Some(string_from_utf16_char_array(&device_info_struct.szName)),
+            address: addr_key.clone(),
+        };
 
         let (connected_callback, displaced_connection) = match BT_STATE.lock() {
             Ok(mut state) => {
-                let displaced_connection = if state.connection_handles.is_some() {
-                    warn!("Connection state changed while connecting; replacing old connection.");
-                    disconnect_internal(&mut state)
-                } else {
-                    None
-                };
-
                 let connection_id = state.next_connection_id;
                 state.next_connection_id = state.next_connection_id.wrapping_add(1);
                 if state.next_connection_id == 0 {
                     state.next_connection_id = 1;
                 }
-
-                state.connection_handles = Some(ConnectedThreadHandles {
-                    socket: sock,
-                    read_thread_handle: None,
-                    stop_flag: Arc::clone(&stop_flag),
-                    socket_close_lock: Arc::clone(&socket_close_lock),
-                    connection_id,
-                });
-                state.connected_device_info = Some(SPPDevice {
-                    name: Some(string_from_utf16_char_array(&device_info_struct.szName)),
-                    address: addr_str.to_string(),
-                });
-
-                (state.on_connected_callback.clone(), displaced_connection)
+                let (connected_callback, displaced_connection) = {
+                    let connection = state
+                        .connections
+                        .entry(addr_key.clone())
+                        .or_insert_with(PerDeviceConnection::new);
+                    // Reconnect teardown is internal to connect: preserve callbacks
+                    // registered for this address before removing the old socket.
+                    let registered_on_connected = connection.on_connected_callback.clone();
+                    let registered_data_listener = connection.data_listener_callback.clone();
+                    let displaced_connection = disconnect_internal(connection);
+                    connection.on_connected_callback = registered_on_connected;
+                    connection.data_listener_callback = registered_data_listener;
+                    connection.connection_handles = Some(ConnectedThreadHandles {
+                        socket: sock,
+                        read_thread_handle: None,
+                        stop_flag: Arc::clone(&stop_flag),
+                        socket_close_lock: Arc::clone(&socket_close_lock),
+                        connection_id,
+                    });
+                    connection.connected_device_info = Some(device_info);
+                    (
+                        connection.on_connected_callback.clone(),
+                        displaced_connection,
+                    )
+                };
+                (connected_callback, displaced_connection)
             }
             Err(_) => {
-                unsafe {
-                    closesocket(sock);
-                }
+                unsafe { closesocket(sock) };
                 return Err(corelib::anyhow_site!(
                     "Failed to lock BT_STATE post connection"
                 ));
@@ -988,79 +1058,93 @@ pub mod core {
         };
 
         finish_disconnect(displaced_connection);
-
         if let Some(callback) = connected_callback {
             callback();
         }
-
         Ok(true)
     }
 
-    pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
+    pub fn get_connected_device_info_impl(addr: &str) -> Result<Option<SPPDevice>> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let state = BT_STATE.lock().map_err(|_| {
             corelib::anyhow_site!("Failed to lock BT_STATE for get_connected_device_info")
         })?;
-        Ok(state.connected_device_info.clone())
+        Ok(state
+            .connections
+            .get(&addr_key)
+            .and_then(|connection| connection.connected_device_info.clone()))
     }
 
-    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
+    pub fn get_max_send_len_impl(addr: &str) -> Result<Option<usize>> {
+        let _ = normalize_addr(addr)?;
         Ok(None)
     }
 
-    pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+    pub fn on_connected_impl(addr: &str, cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let cb: SharedConnectedCallback = Arc::from(cb);
         let should_call_now = {
             let mut state = BT_STATE
                 .lock()
                 .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for on_connected"))?;
-            let should_call_now = state.connected_device_info.is_some();
-            state.on_connected_callback = Some(Arc::clone(&cb));
+            let connection = state
+                .connections
+                .entry(addr_key)
+                .or_insert_with(PerDeviceConnection::new);
+            let should_call_now = connection.connected_device_info.is_some();
+            connection.on_connected_callback = Some(Arc::clone(&cb));
             should_call_now
         };
-
         if should_call_now {
             cb();
         }
-
         Ok(())
     }
 
     pub fn set_data_listener_impl(
+        addr: &str,
         cb: Box<dyn FnMut(Result<Vec<u8>, String>) + Send + 'static>,
     ) -> Result<()> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let mut state = BT_STATE
             .lock()
             .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for set_data_listener"))?;
-        state.data_listener_callback = Some(Arc::new(Mutex::new(cb)));
+        let connection = state
+            .connections
+            .entry(addr_key)
+            .or_insert_with(PerDeviceConnection::new);
+        connection.data_listener_callback = Some(Arc::new(Mutex::new(cb)));
         Ok(())
     }
 
-    pub fn start_subscription_impl() -> Result<()> {
+    pub fn start_subscription_impl(addr: &str) -> Result<()> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let (sock_copy, stop_flag, connection_id) = {
             let state_guard = BT_STATE.lock().map_err(|_| {
                 corelib::anyhow_site!(
                     "Failed to lock BT_STATE for start_subscription (initial check)"
                 )
             })?;
-
-            if let Some(ref handles) = state_guard.connection_handles {
-                if handles.read_thread_handle.is_none() {
-                    (
-                        handles.socket,
-                        Arc::clone(&handles.stop_flag),
-                        handles.connection_id,
-                    )
-                } else {
-                    warn!("Subscription already active or read thread handle exists.");
-                    return Ok(());
-                }
-            } else {
-                corelib::bail_site!("Not connected. Cannot start subscription.");
+            let connection = state_guard.connections.get(&addr_key).ok_or_else(|| {
+                corelib::anyhow_site!("Not connected. Cannot start subscription.")
+            })?;
+            let handles = connection.connection_handles.as_ref().ok_or_else(|| {
+                corelib::anyhow_site!("Not connected. Cannot start subscription.")
+            })?;
+            if handles.read_thread_handle.is_some() {
+                warn!("Subscription already active or read thread handle exists.");
+                return Ok(());
             }
+            (
+                handles.socket,
+                Arc::clone(&handles.stop_flag),
+                handles.connection_id,
+            )
         };
 
         let state_clone_for_thread = Arc::clone(&BT_STATE);
         let stop_flag_for_thread = Arc::clone(&stop_flag);
+        let addr_for_thread = addr_key.clone();
         let read_thread_handle = thread::spawn(move || {
             info!(
                 "Read thread started for connection {} socket {:?}",
@@ -1081,7 +1165,7 @@ pub mod core {
 
                 if bytes_received > 0 {
                     let data = buffer[..bytes_received as usize].to_vec();
-                    notify_data_listener(Ok(data));
+                    notify_data_listener(&addr_for_thread, connection_id, Ok(data));
                 } else if bytes_received == 0 {
                     if stop_flag_for_thread.load(Ordering::Acquire) {
                         info!(
@@ -1090,7 +1174,11 @@ pub mod core {
                         );
                     } else {
                         info!("Connection closed by peer (socket {:?}).", sock_copy);
-                        notify_data_listener(Err("Connection closed by peer".to_string()));
+                        notify_data_listener(
+                            &addr_for_thread,
+                            connection_id,
+                            Err("Connection closed by peer".to_string()),
+                        );
                     }
                     break;
                 } else {
@@ -1110,7 +1198,11 @@ pub mod core {
                         "recv failed with error: {} (socket {:?})",
                         error_code.0, sock_copy
                     );
-                    notify_data_listener(Err(format!("Socket error: {}", error_code.0)));
+                    notify_data_listener(
+                        &addr_for_thread,
+                        connection_id,
+                        Err(format!("Socket error: {}", error_code.0)),
+                    );
                     break;
                 }
             }
@@ -1122,12 +1214,15 @@ pub mod core {
 
             let disconnected = match state_clone_for_thread.lock() {
                 Ok(mut st_lock) => {
-                    let owns_current_connection =
-                        st_lock.connection_handles.as_ref().is_some_and(|handles| {
+                    let owns_current_connection = st_lock
+                        .connections
+                        .get(&addr_for_thread)
+                        .and_then(|connection| connection.connection_handles.as_ref())
+                        .is_some_and(|handles| {
                             handles.connection_id == connection_id && handles.socket == sock_copy
                         });
                     if owns_current_connection {
-                        disconnect_internal(&mut st_lock)
+                        disconnect_connection(&mut st_lock, &addr_for_thread)
                     } else {
                         None
                     }
@@ -1140,55 +1235,67 @@ pub mod core {
             finish_disconnect(disconnected);
         });
 
+        let mut read_thread_handle = Some(read_thread_handle);
         let mut state_guard = BT_STATE.lock().map_err(|_| {
             corelib::anyhow_site!("Failed to lock BT_STATE for start_subscription (update handle)")
         })?;
-
-        match state_guard.connection_handles {
-            Some(ref mut handles)
+        let installed = state_guard
+            .connections
+            .get_mut(&addr_key)
+            .and_then(|connection| connection.connection_handles.as_mut())
+            .is_some_and(|handles| {
                 if handles.socket == sock_copy
                     && handles.connection_id == connection_id
-                    && handles.read_thread_handle.is_none() =>
-            {
-                handles.read_thread_handle = Some(read_thread_handle);
-                info!("Subscription started successfully.");
-            }
-            _ => {
-                stop_flag.store(true, Ordering::Release);
-                unsafe {
-                    if shutdown(sock_copy, SD_BOTH) != 0 {
-                        warn!(
-                            "socket shutdown failed after subscription race: {}",
-                            WSAGetLastError().0
-                        );
-                    }
+                    && handles.read_thread_handle.is_none()
+                {
+                    handles.read_thread_handle = read_thread_handle.take();
+                    true
+                } else {
+                    false
                 }
-                drop(state_guard);
-                read_thread_handle
+            });
+        if installed {
+            info!("Subscription started successfully.");
+        } else {
+            stop_flag.store(true, Ordering::Release);
+            unsafe {
+                if shutdown(sock_copy, SD_BOTH) != 0 {
+                    warn!(
+                        "socket shutdown failed after subscription race: {}",
+                        WSAGetLastError().0
+                    );
+                }
+            }
+            drop(state_guard);
+            if let Some(handle) = read_thread_handle {
+                handle
                     .join()
                     .unwrap_or_else(|e| warn!("Read thread join error after race: {:?}", e));
-                warn!(
-                    "Could not start subscription, state might have changed or connection is different."
-                );
             }
+            warn!("Could not start subscription, state might have changed or connection is different.");
         }
         Ok(())
     }
 
-    pub fn send_impl(data: &[u8]) -> Result<()> {
+    pub fn send_impl(addr: &str, data: &[u8]) -> Result<()> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let (socket, stop_flag, socket_close_lock) = {
             let state = BT_STATE
                 .lock()
                 .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for send"))?;
-            if let Some(ref handles) = state.connection_handles {
-                (
-                    handles.socket,
-                    Arc::clone(&handles.stop_flag),
-                    Arc::clone(&handles.socket_close_lock),
-                )
-            } else {
-                corelib::bail_site!("Not connected. Cannot send data.");
-            }
+            let connection = state
+                .connections
+                .get(&addr_key)
+                .ok_or_else(|| corelib::anyhow_site!("Not connected. Cannot send data."))?;
+            let handles = connection
+                .connection_handles
+                .as_ref()
+                .ok_or_else(|| corelib::anyhow_site!("Not connected. Cannot send data."))?;
+            (
+                handles.socket,
+                Arc::clone(&handles.stop_flag),
+                Arc::clone(&handles.socket_close_lock),
+            )
         };
 
         if stop_flag.load(Ordering::Acquire) {
@@ -1227,42 +1334,18 @@ pub mod core {
         Ok(())
     }
 
-    fn disconnect_internal(state: &mut GlobalState) -> Option<DisconnectedConnection> {
-        let disconnected = if let Some(handles) = state.connection_handles.take() {
-            info!(
-                "Disconnecting connection {} socket {:?}",
-                handles.connection_id, handles.socket
-            );
-            handles.stop_flag.store(true, Ordering::Release);
-            unsafe {
-                if shutdown(handles.socket, SD_BOTH) != 0 {
-                    warn!("socket shutdown failed: {}", WSAGetLastError().0);
-                }
-            }
-            Some(DisconnectedConnection {
-                socket: handles.socket,
-                read_thread_handle: handles.read_thread_handle,
-                socket_close_lock: handles.socket_close_lock,
-                connection_id: handles.connection_id,
-            })
-        } else {
-            None
-        };
-        state.connected_device_info = None;
-        if disconnected.is_some() {
-            info!("Disconnected.");
-        }
-        disconnected
-    }
-
-    pub fn disconnect_impl() -> Result<()> {
+    pub fn disconnect_impl(addr: &str) -> Result<()> {
+        let (_, addr_key) = normalize_addr(addr)?;
         let disconnected = {
             let mut state = BT_STATE
                 .lock()
                 .map_err(|_| corelib::anyhow_site!("Failed to lock BT_STATE for disconnect"))?;
-            disconnect_internal(&mut state)
+            let disconnected = disconnect_connection(&mut state, &addr_key);
+            // Targeted disconnect also drops callbacks registered for this address,
+            // so a failed connection cannot inherit them on a later reconnect.
+            state.connections.remove(&addr_key);
+            disconnected
         };
-
         finish_disconnect(disconnected);
         Ok(())
     }

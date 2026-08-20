@@ -40,67 +40,66 @@ impl<R: Runtime> BtclassicSpp<R> {
         core::get_scanned_devices_impl().map(|devices| GetScannedDevicesResult { ret: devices })
     }
 
-    // remove bond参数仅在安卓端起效
-    pub fn connect(&self, addr: &String, _remove_bond: bool) -> anyhow::Result<ConnectResult> {
-        core::connect_impl(addr).map(|success| ConnectResult { ret: success })
-    }
-
-    pub fn connect_with_fallback_channels(
+    pub fn connect(
         &self,
-        addr: &String,
+        addr: &str,
         _remove_bond: bool,
         fallback_channels: &[u8],
     ) -> anyhow::Result<ConnectResult> {
-        core::connect_impl_with_fallback_channels(addr, fallback_channels)
-            .map(|success| ConnectResult { ret: success })
+        core::connect_impl(addr, fallback_channels).map(|success| ConnectResult { ret: success })
     }
 
-    pub fn get_connected_device_info(&self) -> anyhow::Result<SPPDevice> {
-        core::get_connected_device_info_impl()?
-            .ok_or_else(|| corelib::anyhow_site!("No device connected or info unavailable"))
+    pub fn get_connected_device_info(&self, addr: &str) -> anyhow::Result<SPPDevice> {
+        core::get_connected_device_info_impl(addr)?
+            .ok_or_else(|| corelib::anyhow_site!("No device connected for {addr}"))
     }
 
-    pub fn get_max_send_len(&self) -> anyhow::Result<Option<usize>> {
-        core::get_max_send_len_impl()
+    pub fn get_max_send_len(&self, addr: &str) -> anyhow::Result<Option<usize>> {
+        core::get_max_send_len_impl(addr)
     }
 
-    pub fn on_connected<F>(&self, cb: F) -> anyhow::Result<()>
+    pub fn on_connected<F>(&self, addr: &str, cb: F) -> anyhow::Result<()>
     where
         F: Fn() + Send + Sync + 'static,
     {
-        core::on_connected_impl(Box::new(cb))
+        core::on_connected_impl(addr, Box::new(cb))
     }
 
     pub fn set_data_listener(
         &self,
-        cb: impl FnMut(Result<Vec<u8>, String>) + Send + 'static, // 修改签名以接受 Result
+        addr: &str,
+        cb: impl FnMut(Result<Vec<u8>, String>) + Send + 'static,
     ) -> anyhow::Result<()> {
-        let mut user_cb = cb; // user_cb 现在是 FnMut(Result<Vec<u8>, String>)
-        let core_cb = move |result: Result<Vec<u8>, String>| {
-            user_cb(result); // 直接传递 Result
-        };
-        core::set_data_listener_impl(Box::new(core_cb))
+        core::set_data_listener_impl(addr, Box::new(cb))
     }
 
-    pub fn start_subscription(&self) -> anyhow::Result<()> {
-        core::start_subscription_impl()
+    pub fn start_subscription(&self, addr: &str) -> anyhow::Result<()> {
+        core::start_subscription_impl(addr)
     }
 
-    pub fn send(&self, data: &[u8]) -> anyhow::Result<()> {
-        match core::send_impl(data) {
+    pub fn send(&self, addr: &str, data: &[u8]) -> anyhow::Result<()> {
+        match core::send_impl(addr, data) {
             Ok(()) => Ok(()),
             Err(err) => {
-                log::error!("send msg error {}", err);
+                log::error!("send msg error for {}: {}", addr, err);
                 Err(corelib::anyhow_site!("{}", err))
             }
         }
     }
 
-    pub fn disconnect(&self) -> anyhow::Result<()> {
-        let ret = core::disconnect_impl();
+    pub fn disconnect(&self, addr: &str) -> anyhow::Result<()> {
+        core::disconnect_impl(addr)
+    }
+
+    /// Shut down every transport session during application teardown.
+    pub fn disconnect_all(&self) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            core::disconnect_all_impl()?;
+            core::stop_scan_impl()?;
+        }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         imp::cleanup_bluetooth_resources();
-
-        ret
+        Ok(())
     }
 }

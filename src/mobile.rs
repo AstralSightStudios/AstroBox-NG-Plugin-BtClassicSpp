@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose, Engine};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tauri::{
@@ -31,6 +31,35 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 /// 访问 btclassic-spp API
 pub struct BtclassicSpp<R: Runtime>(PluginHandle<R>);
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressArg<'a> {
+    addr: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressChannelArg<'a> {
+    addr: &'a str,
+    channel: Channel<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressSendPayload {
+    addr: String,
+    b64data: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressSetDataListenerResult {
+    #[allow(dead_code)]
+    addr: String,
+    ret: String,
+    err: Option<String>,
+}
+
 impl<R: Runtime> BtclassicSpp<R> {
     /* ---------- 无返回值调用 ---------- */
     pub fn start_scan(&self) -> anyhow::Result<()> {
@@ -57,18 +86,9 @@ impl<R: Runtime> BtclassicSpp<R> {
             .map_err(Into::into)
     }
 
-    pub fn connect(&self, addr: &String, remove_bond: bool) -> anyhow::Result<ConnectResult> {
-        let arg = ConnectArg {
-            addr: addr.to_owned(),
-            remove_bond,
-            fallback_channels: Vec::new(),
-        };
-        self.0.run_mobile_plugin("connect", arg).map_err(Into::into)
-    }
-
-    pub fn connect_with_fallback_channels(
+    pub fn connect(
         &self,
-        addr: &String,
+        addr: &str,
         remove_bond: bool,
         fallback_channels: &[u8],
     ) -> anyhow::Result<ConnectResult> {
@@ -80,7 +100,7 @@ impl<R: Runtime> BtclassicSpp<R> {
         self.0.run_mobile_plugin("connect", arg).map_err(Into::into)
     }
 
-    pub fn connect_ble(&self, addr: &String) -> anyhow::Result<ConnectResult> {
+    pub fn connect_ble(&self, addr: &str) -> anyhow::Result<ConnectResult> {
         let arg = ConnectArg {
             addr: addr.to_owned(),
             remove_bond: false,
@@ -91,46 +111,48 @@ impl<R: Runtime> BtclassicSpp<R> {
             .map_err(Into::into)
     }
 
-    pub fn disconnect(&self) -> anyhow::Result<()> {
+    pub fn disconnect(&self, addr: &str) -> anyhow::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("disconnect", ())
+            .run_mobile_plugin::<()>("disconnect", AddressArg { addr })
             .map_err(Into::into)
     }
 
-    pub fn disconnect_ble(&self) -> anyhow::Result<()> {
+    pub fn disconnect_ble(&self, addr: &str) -> anyhow::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("disconnectBle", ())
+            .run_mobile_plugin::<()>("disconnectBle", AddressArg { addr })
             .map_err(Into::into)
     }
 
-    pub fn start_subscription(&self) -> anyhow::Result<()> {
+    pub fn start_subscription(&self, addr: &str) -> anyhow::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("startSubscription", ())
+            .run_mobile_plugin::<()>("startSubscription", AddressArg { addr })
             .map_err(Into::into)
     }
 
-    pub fn start_ble_subscription(&self) -> anyhow::Result<()> {
+    pub fn start_ble_subscription(&self, addr: &str) -> anyhow::Result<()> {
         self.0
-            .run_mobile_plugin::<()>("startBleSubscription", ())
+            .run_mobile_plugin::<()>("startBleSubscription", AddressArg { addr })
             .map_err(Into::into)
     }
 
-    pub fn send(&self, data: &[u8]) -> anyhow::Result<()> {
+    pub fn send(&self, addr: &str, data: &[u8]) -> anyhow::Result<()> {
         self.0
             .run_mobile_plugin::<()>(
                 "send",
-                SPPSendPayload {
+                AddressSendPayload {
+                    addr: addr.to_owned(),
                     b64data: general_purpose::STANDARD.encode(data),
                 },
             )
             .map_err(Into::into)
     }
 
-    pub fn send_ble(&self, data: &[u8]) -> anyhow::Result<()> {
+    pub fn send_ble(&self, addr: &str, data: &[u8]) -> anyhow::Result<()> {
         self.0
             .run_mobile_plugin::<()>(
                 "sendBle",
-                SPPSendPayload {
+                AddressSendPayload {
+                    addr: addr.to_owned(),
                     b64data: general_purpose::STANDARD.encode(data),
                 },
             )
@@ -150,30 +172,30 @@ impl<R: Runtime> BtclassicSpp<R> {
             .map_err(Into::into)
     }
 
-    pub fn get_connected_device_info(&self) -> anyhow::Result<SPPDevice> {
+    pub fn get_connected_device_info(&self, addr: &str) -> anyhow::Result<SPPDevice> {
         self.0
-            .run_mobile_plugin("getConnectedDeviceInfo", ())
+            .run_mobile_plugin("getConnectedDeviceInfo", AddressArg { addr })
             .map_err(Into::into)
     }
 
-    pub fn get_max_send_len(&self) -> anyhow::Result<Option<usize>> {
+    pub fn get_max_send_len(&self, addr: &str) -> anyhow::Result<Option<usize>> {
         let ret: GetMaxSendLenResult = self
             .0
-            .run_mobile_plugin("getMaxSendLen", ())
+            .run_mobile_plugin("getMaxSendLen", AddressArg { addr })
             .map_err(anyhow::Error::from)?;
         Ok(ret.ret)
     }
 
-    pub fn get_ble_max_send_len(&self) -> anyhow::Result<Option<usize>> {
+    pub fn get_ble_max_send_len(&self, addr: &str) -> anyhow::Result<Option<usize>> {
         let ret: GetMaxSendLenResult = self
             .0
-            .run_mobile_plugin("getBleMaxSendLen", ())
+            .run_mobile_plugin("getBleMaxSendLen", AddressArg { addr })
             .map_err(anyhow::Error::from)?;
         Ok(ret.ret)
     }
 
     /* ---------- 事件回调 ---------- */
-    pub fn on_connected<F>(&self, cb: F) -> anyhow::Result<()>
+    pub fn on_connected<F>(&self, addr: &str, cb: F) -> anyhow::Result<()>
     where
         F: Fn() + Send + Sync + 'static,
     {
@@ -182,58 +204,51 @@ impl<R: Runtime> BtclassicSpp<R> {
             (cb_arc)();
             Ok(())
         });
-
-        self.0.run_mobile_plugin::<()>("onConnected", channel)?;
+        self.0
+            .run_mobile_plugin::<()>("onConnected", AddressChannelArg { addr, channel })?;
         Ok(())
     }
 
-    pub fn set_data_listener<F>(&self, cb: F) -> anyhow::Result<()>
+    pub fn set_data_listener<F>(&self, addr: &str, cb: F) -> anyhow::Result<()>
     where
         F: FnMut(Result<Vec<u8>, String>) + Send + 'static,
     {
         let cb_arc = Arc::new(Mutex::new(cb));
-
-        let channel = Channel::<()>::new({
+        let channel = Channel::<Value>::new({
             let cb_arc = Arc::clone(&cb_arc);
             move |raw: InvokeResponseBody| {
-                let msg: SetDataListenerResult = match raw.deserialize() {
+                let msg: AddressSetDataListenerResult = match raw.deserialize() {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("setDataListener (mobile): deserialize error: {e}");
                         if let Ok(mut f) = cb_arc.lock() {
                             (f)(Err(format!("Deserialize error from mobile: {}", e)));
                         }
                         return Ok(());
                     }
                 };
-
                 if let Some(err_msg) = msg.err {
-                    eprintln!("SPP read error (Android): {}", err_msg);
                     if let Ok(mut f) = cb_arc.lock() {
                         (f)(Err(err_msg));
                     }
                     return Ok(());
                 }
-
                 let bytes = match general_purpose::STANDARD.decode(msg.ret) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!("Base64 decode error (mobile): {e}");
                         if let Ok(mut f) = cb_arc.lock() {
                             (f)(Err(format!("Base64 decode error from mobile: {}", e)));
                         }
                         return Ok(());
                     }
                 };
-
                 if let Ok(mut f) = cb_arc.lock() {
                     (f)(Ok(bytes));
                 }
                 Ok(())
             }
         });
-
-        self.0.run_mobile_plugin::<()>("setDataListener", channel)?;
+        self.0
+            .run_mobile_plugin::<()>("setDataListener", AddressChannelArg { addr, channel })?;
         Ok(())
     }
 }

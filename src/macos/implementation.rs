@@ -11,6 +11,7 @@ use objc2_io_bluetooth::{
 use objc2_io_kit::kIOReturnSuccess;
 use once_cell::sync::Lazy;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -55,18 +56,21 @@ struct SharedState {
     scanned_devices: Vec<SPPDevice>,
     /// true = 连续扫描循环开启；false = stop_scan_impl 已请求停止
     scan_loop_running: bool,
-    connected_device_info: Option<SPPDevice>,
-    on_connected_callback: Option<Box<dyn Fn() + Send + Sync + 'static>>,
-    data_listener_callback: Option<Box<dyn FnMut(Result<Vec<u8>, String>) + Send + 'static>>,
+    /// Connection state is keyed by the canonical device address.  Scanning is
+    /// intentionally left global, but nothing below the scan state is global.
+    connected_device_info: HashMap<String, SPPDevice>,
+    on_connected_callbacks: HashMap<String, Box<dyn Fn() + Send + Sync + 'static>>,
+    data_listener_callbacks:
+        HashMap<String, Box<dyn FnMut(Result<Vec<u8>, String>) + Send + 'static>>,
 }
 impl SharedState {
     fn new() -> Self {
         Self {
             scanned_devices: Vec::new(),
             scan_loop_running: false,
-            connected_device_info: None,
-            on_connected_callback: None,
-            data_listener_callback: None,
+            connected_device_info: HashMap::new(),
+            on_connected_callbacks: HashMap::new(),
+            data_listener_callbacks: HashMap::new(),
         }
     }
 }
@@ -75,8 +79,11 @@ impl SharedState {
 struct MainThreadState {
     inquiry: Option<Retained<IOBluetoothDeviceInquiry>>,
     delegate: Option<Retained<BTDelegate>>,
-    rfcomm_channel: Option<Retained<IOBluetoothRFCOMMChannel>>,
-    pending_send: Option<PendingRfcommSend>,
+    rfcomm_channels: HashMap<String, Retained<IOBluetoothRFCOMMChannel>>,
+    /// The delegate only receives a channel.  Keep the reverse index so every
+    /// callback is dispatched to the connection that owns that channel.
+    channel_addrs: HashMap<usize, String>,
+    pending_sends: HashMap<String, PendingRfcommSend>,
 }
 
 static SHARED_BT_STATE: Lazy<Arc<Mutex<SharedState>>> =
@@ -108,11 +115,30 @@ fn is_retryable_rfcomm_backpressure(status: i32) -> bool {
     )
 }
 
-fn complete_pending_rfcomm_send(result: Result<()>) {
+fn channel_key(chan: &IOBluetoothRFCOMMChannel) -> usize {
+    chan as *const IOBluetoothRFCOMMChannel as usize
+}
+
+fn channel_addr(chan: &IOBluetoothRFCOMMChannel) -> Option<String> {
+    MAIN_THREAD_STATE.with(|cell| cell.borrow().channel_addrs.get(&channel_key(chan)).cloned())
+}
+
+fn remove_channel_for_addr(addr: &str) -> Option<Retained<IOBluetoothRFCOMMChannel>> {
+    MAIN_THREAD_STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let channel = state.rfcomm_channels.remove(addr);
+        if let Some(chan) = channel.as_ref() {
+            state.channel_addrs.remove(&channel_key(chan));
+        }
+        channel
+    })
+}
+
+fn complete_pending_rfcomm_send(addr: &str, result: Result<()>) {
     let tx = MAIN_THREAD_STATE.with(|cell| {
         cell.borrow_mut()
-            .pending_send
-            .take()
+            .pending_sends
+            .remove(addr)
             .and_then(|mut pending| pending.completion_tx.take())
     });
     if let Some(tx) = tx {
@@ -120,13 +146,13 @@ fn complete_pending_rfcomm_send(result: Result<()>) {
     }
 }
 
-fn cancel_pending_rfcomm_send() {
+fn cancel_pending_rfcomm_send(addr: &str) {
     MAIN_THREAD_STATE.with(|cell| {
-        cell.borrow_mut().pending_send = None;
+        cell.borrow_mut().pending_sends.remove(addr);
     });
 }
 
-fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
+fn pump_pending_rfcomm_send(addr: &str, chan: &IOBluetoothRFCOMMChannel) {
     loop {
         enum Action {
             Continue,
@@ -138,7 +164,7 @@ fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
 
         let action = MAIN_THREAD_STATE.with(|cell| {
             let mut state = cell.borrow_mut();
-            let Some(pending) = state.pending_send.as_mut() else {
+            let Some(pending) = state.pending_sends.get_mut(addr) else {
                 return Action::Noop;
             };
 
@@ -189,11 +215,11 @@ fn pump_pending_rfcomm_send(chan: &IOBluetoothRFCOMMChannel) {
             Action::Continue => continue,
             Action::Wait | Action::Noop => break,
             Action::Complete => {
-                complete_pending_rfcomm_send(Ok(()));
+                complete_pending_rfcomm_send(addr, Ok(()));
                 break;
             }
             Action::Fail(err) => {
-                complete_pending_rfcomm_send(Err(corelib::anyhow_site!("{}", err)));
+                complete_pending_rfcomm_send(addr, Err(corelib::anyhow_site!("{}", err)));
                 break;
             }
         }
@@ -274,9 +300,13 @@ define_class! {
             data:  *mut c_void,
             len:   usize,
         ) {
+            let Some(addr) = channel_addr(_chan) else {
+                log::warn!("Received RFCOMM data for an unknown channel");
+                return;
+            };
             let slice = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
             if let Ok(mut st) = SHARED_BT_STATE.lock() {
-                if let Some(cb) = st.data_listener_callback.as_mut() {
+                if let Some(cb) = st.data_listener_callbacks.get_mut(&addr) {
                     cb(Ok(slice.to_vec()));
                 }
             }
@@ -288,23 +318,44 @@ define_class! {
             chan:   &IOBluetoothRFCOMMChannel,
             status: i32,
         ) {
+            let Some(addr) = channel_addr(chan) else {
+                log::warn!("RFCOMM open callback for an unknown channel");
+                return;
+            };
+
             if status == kIOReturnSuccess {
-                MAIN_THREAD_STATE.with(|c| c.borrow_mut().rfcomm_channel = Some(chan.retain()));
+                MAIN_THREAD_STATE.with(|c| {
+                    let mut state = c.borrow_mut();
+                    state
+                        .rfcomm_channels
+                        .insert(addr.clone(), chan.retain());
+                    state.channel_addrs.insert(channel_key(chan), addr.clone());
+                });
                 if let Ok(st) = SHARED_BT_STATE.lock() {
-                    if let Some(cb) = st.on_connected_callback.as_ref() {
+                    if let Some(cb) = st.on_connected_callbacks.get(&addr) {
                         cb();
                     }
                 }
-            } else if let Ok(mut st) = SHARED_BT_STATE.lock() {
-                st.connected_device_info = None;
-                if let Some(cb) = st.data_listener_callback.as_mut() {
-                    cb(Err("Connection closed".into()));
+            } else {
+                remove_channel_for_addr(&addr);
+                complete_pending_rfcomm_send(
+                    &addr,
+                    Err(corelib::anyhow_site!("RFCOMM channel failed to open")),
+                );
+                audio_guard::stop_for(&addr);
+                if let Ok(mut st) = SHARED_BT_STATE.lock() {
+                    st.connected_device_info.remove(&addr);
+                    st.on_connected_callbacks.remove(&addr);
+                    if let Some(mut cb) = st.data_listener_callbacks.remove(&addr) {
+                        cb(Err("Connection closed".into()));
+                    }
                 }
             }
         }
 
         #[unsafe(method(rfcommChannelClosed:))]
         fn rfcomm_channel_closed(&self, chan: &IOBluetoothRFCOMMChannel) {
+            let addr = channel_addr(chan);
             unsafe {
                 let _ = chan.closeChannel();
                 if let Some(dev_retained) = chan.getDevice() {
@@ -313,19 +364,24 @@ define_class! {
                 }
             }
 
-            MAIN_THREAD_STATE.with(|c| c.borrow_mut().rfcomm_channel = None);
-            complete_pending_rfcomm_send(Err(corelib::anyhow_site!(
-                "Connection closed during RFCOMM send"
-            )));
-            if let Ok(mut st) = SHARED_BT_STATE.lock() {
-                st.connected_device_info = None;
-                if let Some(cb) = st.data_listener_callback.as_mut() {
-                    cb(Err("Connection closed".into()));
+            if let Some(addr) = addr {
+                remove_channel_for_addr(&addr);
+                complete_pending_rfcomm_send(
+                    &addr,
+                    Err(corelib::anyhow_site!(
+                        "Connection closed during RFCOMM send"
+                    )),
+                );
+                audio_guard::stop_for(&addr);
+                if let Ok(mut st) = SHARED_BT_STATE.lock() {
+                    st.connected_device_info.remove(&addr);
+                    st.on_connected_callbacks.remove(&addr);
+                    if let Some(mut cb) = st.data_listener_callbacks.remove(&addr) {
+                        cb(Err("Connection closed".into()));
+                    }
                 }
+                log::info!("Device {} disconnected", addr);
             }
-
-            log::info!("Device disconnected. cleaning up bluetooth resources...");
-            cleanup_bluetooth_resources();
         }
 
         #[unsafe(method(rfcommChannelWriteComplete:refcon:status:))]
@@ -335,33 +391,43 @@ define_class! {
             _refcon: *mut c_void,
             status: i32,
         ) {
+            let Some(addr) = channel_addr(chan) else {
+                return;
+            };
             if status != kIOReturnSuccess {
-                complete_pending_rfcomm_send(Err(corelib::anyhow_site!(
-                    "RFCOMM async write failed with status {}",
-                    status
-                )));
+                complete_pending_rfcomm_send(
+                    &addr,
+                    Err(corelib::anyhow_site!(
+                        "RFCOMM async write failed with status {}",
+                        status
+                    )),
+                );
                 return;
             }
 
             MAIN_THREAD_STATE.with(|cell| {
                 let mut state = cell.borrow_mut();
-                if let Some(pending) = state.pending_send.as_mut() {
+                if let Some(pending) = state.pending_sends.get_mut(&addr) {
                     pending.in_flight = pending.in_flight.saturating_sub(1);
                 }
             });
 
-            pump_pending_rfcomm_send(chan);
+            pump_pending_rfcomm_send(&addr, chan);
         }
 
         #[unsafe(method(rfcommChannelQueueSpaceAvailable:))]
         fn rfcomm_channel_queue_space_available(&self, chan: &IOBluetoothRFCOMMChannel) {
-            pump_pending_rfcomm_send(chan);
+            if let Some(addr) = channel_addr(chan) {
+                pump_pending_rfcomm_send(&addr, chan);
+            }
         }
 
         #[unsafe(method(rfcommChannelFlowControlChanged:))]
         fn rfcomm_channel_flow_control_changed(&self, chan: &IOBluetoothRFCOMMChannel) {
             if !unsafe { chan.isTransmissionPaused() } {
-                pump_pending_rfcomm_send(chan);
+                if let Some(addr) = channel_addr(chan) {
+                    pump_pending_rfcomm_send(&addr, chan);
+                }
             }
         }
     }
@@ -534,18 +600,14 @@ pub mod core {
     }
 
     /* ---- 连接 ---- */
-    pub fn connect_impl(addr_str: &str) -> Result<bool> {
-        connect_impl_with_fallback_channels(addr_str, &[5, 1])
-    }
-
-    pub fn connect_impl_with_fallback_channels(
-        addr_str: &str,
-        fallback_channels: &[u8],
-    ) -> Result<bool> {
-        let addr = addr_str.to_string();
+    pub fn connect_impl(addr_str: &str, fallback_channels: &[u8]) -> Result<bool> {
+        let addr = normalize_addr_from_macos(addr_str);
         let fallback_channels = normalized_fallback_channels(fallback_channels);
         run_on_main_thread(move |mtm| {
             stop_scan_impl().ok();
+            // Tear down an old channel for this address without discarding
+            // callbacks that were registered for the connection being opened.
+            disconnect_addr_on_main_thread_preserving_callbacks(&addr).ok();
 
             /* ---- 找到目标设备 ---- */
             let dev_opt: Option<Retained<IOBluetoothDevice>> = {
@@ -595,23 +657,26 @@ pub mod core {
                     )
                 };
                 if status == kIOReturnSuccess {
-                    /* ---- 保存通道 & “正在连接” 信息 ---- */
                     if let Some(chan) = chan_opt {
-                        MAIN_THREAD_STATE
-                            .with(|cell| cell.borrow_mut().rfcomm_channel = Some(chan));
+                        let key = channel_key(&chan);
+                        MAIN_THREAD_STATE.with(|cell| {
+                            let mut state = cell.borrow_mut();
+                            state.channel_addrs.insert(key, addr.clone());
+                            state.rfcomm_channels.insert(addr.clone(), chan);
+                        });
                     }
 
                     /* 提前写入 pending device，保持原 Windows 语义 */
-                    SHARED_BT_STATE
-                        .lock()
-                        .map_err(|_| {
-                            corelib::anyhow_site!("Failed to acquire Bluetooth state lock")
-                        })?
-                        .connected_device_info = Some(SPPDevice {
-                        name: dev_name.clone(),
-                        address: addr.clone(),
-                    });
-
+                    let mut st = SHARED_BT_STATE.lock().map_err(|_| {
+                        corelib::anyhow_site!("Failed to acquire Bluetooth state lock")
+                    })?;
+                    st.connected_device_info.insert(
+                        addr.clone(),
+                        SPPDevice {
+                            name: dev_name.clone(),
+                            address: addr.clone(),
+                        },
+                    );
                     log::info!("RFCOMM connect request sent on channel {}", ch_id);
                     return Ok(true);
                 }
@@ -620,24 +685,27 @@ pub mod core {
             }
 
             /* 全部通道失败：停掉音频守护，避免悬留监听 */
-            audio_guard::stop();
+            disconnect_addr_on_main_thread(&addr).ok();
             corelib::bail_site!("All RFCOMM channel attempts failed (last={:?})", last_error);
         })
     }
 
-    pub fn get_connected_device_info_impl() -> Result<Option<SPPDevice>> {
+    pub fn get_connected_device_info_impl(addr: &str) -> Result<Option<SPPDevice>> {
+        let addr = normalize_addr_from_macos(addr);
         Ok(SHARED_BT_STATE
             .lock()
             .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
             .connected_device_info
-            .clone())
+            .get(&addr)
+            .cloned())
     }
 
-    pub fn get_max_send_len_impl() -> Result<Option<usize>> {
-        run_on_main_thread(|_| {
+    pub fn get_max_send_len_impl(addr: &str) -> Result<Option<usize>> {
+        let addr = normalize_addr_from_macos(addr);
+        run_on_main_thread(move |_| {
             MAIN_THREAD_STATE.with(|cell| {
                 let state = cell.borrow();
-                let Some(chan) = state.rfcomm_channel.as_ref() else {
+                let Some(chan) = state.rfcomm_channels.get(&addr) else {
                     return Ok(None);
                 };
                 let mtu = unsafe { chan.getMTU() } as usize;
@@ -647,47 +715,55 @@ pub mod core {
     }
 
     /* ---- 回调设置 ---- */
-    pub fn on_connected_impl(cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+    pub fn on_connected_impl(addr: &str, cb: Box<dyn Fn() + Send + Sync + 'static>) -> Result<()> {
+        let addr = normalize_addr_from_macos(addr);
         SHARED_BT_STATE
             .lock()
             .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
-            .on_connected_callback = Some(cb);
+            .on_connected_callbacks
+            .insert(addr, cb);
         Ok(())
     }
 
     pub fn set_data_listener_impl(
+        addr: &str,
         cb: Box<dyn FnMut(Result<Vec<u8>, String>) + Send + 'static>,
     ) -> Result<()> {
+        let addr = normalize_addr_from_macos(addr);
         SHARED_BT_STATE
             .lock()
             .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
-            .data_listener_callback = Some(cb);
+            .data_listener_callbacks
+            .insert(addr, cb);
         Ok(())
     }
 
-    pub fn start_subscription_impl() -> Result<()> {
+    pub fn start_subscription_impl(addr: &str) -> Result<()> {
+        let _ = addr;
         /* macOS 的 IOBluetoothRFCOMMChannel 已自动回调数据，
         不需要额外线程，直接返回 OK */
         Ok(())
     }
 
     /* ---- 数据发送 & 断开 ---- */
-    pub fn send_impl(data: &[u8]) -> Result<()> {
+    pub fn send_impl(addr: &str, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
+        let addr = normalize_addr_from_macos(addr);
         let payload = data.to_vec();
         let (tx, rx) = mpsc::channel();
+        let send_addr = addr.clone();
 
         run_on_main_thread(move |_mtm| {
             let chan = MAIN_THREAD_STATE.with(|cell| {
                 let mut state = cell.borrow_mut();
-                let Some(chan) = state.rfcomm_channel.clone() else {
+                let Some(chan) = state.rfcomm_channels.get(&send_addr).cloned() else {
                     return Err(corelib::anyhow_site!(
                         "Device not connected, cannot send data"
                     ));
                 };
-                if state.pending_send.is_some() {
+                if state.pending_sends.contains_key(&send_addr) {
                     return Err(corelib::anyhow_site!("RFCOMM send already in progress"));
                 }
 
@@ -697,24 +773,28 @@ pub mod core {
                     .map(|chunk| chunk.to_vec())
                     .collect::<Vec<_>>();
 
-                state.pending_send = Some(PendingRfcommSend {
-                    chunks,
-                    next_chunk_idx: 0,
-                    in_flight: 0,
-                    completion_tx: Some(tx),
-                });
+                state.pending_sends.insert(
+                    send_addr.clone(),
+                    PendingRfcommSend {
+                        chunks,
+                        next_chunk_idx: 0,
+                        in_flight: 0,
+                        completion_tx: Some(tx),
+                    },
+                );
                 Ok(chan)
             })?;
 
-            pump_pending_rfcomm_send(&chan);
+            pump_pending_rfcomm_send(&send_addr, &chan);
             Ok::<(), anyhow::Error>(())
         })?;
 
         match rx.recv_timeout(RFCOMM_ASYNC_SEND_TIMEOUT) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                run_on_main_thread(|_| {
-                    cancel_pending_rfcomm_send();
+                run_on_main_thread({
+                    let addr = addr.clone();
+                    move |_| cancel_pending_rfcomm_send(&addr)
                 });
                 Err(corelib::anyhow_site!(
                     "RFCOMM async send timed out after {:?}",
@@ -722,8 +802,9 @@ pub mod core {
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                run_on_main_thread(|_| {
-                    cancel_pending_rfcomm_send();
+                run_on_main_thread({
+                    let addr = addr.clone();
+                    move |_| cancel_pending_rfcomm_send(&addr)
                 });
                 Err(corelib::anyhow_site!(
                     "RFCOMM async send completion channel disconnected"
@@ -732,27 +813,85 @@ pub mod core {
         }
     }
 
-    pub fn disconnect_impl() -> Result<()> {
-        run_on_main_thread(|_mtm| {
-            // 断开即不再有手表，撤掉音频守护，恢复系统默认输出行为。
-            audio_guard::stop();
-            let maybe_chan = MAIN_THREAD_STATE.with(|c| c.borrow_mut().rfcomm_channel.take());
-            if let Some(chan) = maybe_chan {
-                let status = unsafe { chan.closeChannel() };
-                unsafe {
-                    if let Some(dev_retained) = chan.getDevice() {
-                        let dev: &IOBluetoothDevice = &*dev_retained;
-                        let _status: i32 = msg_send![dev, closeConnection];
-                    }
-                }
-                if status != kIOReturnSuccess {
-                    eprintln!("Failed to close RFCOMM channel, error code: {}", status);
+    fn disconnect_addr_on_main_thread_preserving_callbacks(addr: &str) -> Result<()> {
+        disconnect_addr_on_main_thread_inner(addr, false)
+    }
+
+    fn disconnect_addr_on_main_thread(addr: &str) -> Result<()> {
+        disconnect_addr_on_main_thread_inner(addr, true)
+    }
+
+    fn disconnect_addr_on_main_thread_inner(addr: &str, clear_callbacks: bool) -> Result<()> {
+        audio_guard::stop_for(addr);
+        let maybe_chan = remove_channel_for_addr(addr);
+        complete_pending_rfcomm_send(
+            addr,
+            Err(corelib::anyhow_site!(
+                "Connection disconnected during RFCOMM send"
+            )),
+        );
+        if let Some(chan) = maybe_chan {
+            let status = unsafe { chan.closeChannel() };
+            unsafe {
+                if let Some(dev_retained) = chan.getDevice() {
+                    let dev: &IOBluetoothDevice = &*dev_retained;
+                    let _status: i32 = msg_send![dev, closeConnection];
                 }
             }
-            SHARED_BT_STATE
-                .lock()
-                .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?
-                .connected_device_info = None;
+            if status != kIOReturnSuccess {
+                eprintln!("Failed to close RFCOMM channel, error code: {}", status);
+            }
+        }
+        let mut st = SHARED_BT_STATE
+            .lock()
+            .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?;
+        st.connected_device_info.remove(addr);
+        if clear_callbacks {
+            st.on_connected_callbacks.remove(addr);
+            st.data_listener_callbacks.remove(addr);
+        }
+        Ok(())
+    }
+
+    pub fn disconnect_impl(addr: &str) -> Result<()> {
+        let addr = normalize_addr_from_macos(addr);
+        run_on_main_thread(move |_| disconnect_addr_on_main_thread(&addr))
+    }
+
+    pub fn disconnect_all_impl() -> Result<()> {
+        run_on_main_thread(|_| {
+            let mut addrs = {
+                let st = SHARED_BT_STATE
+                    .lock()
+                    .map_err(|_| corelib::anyhow_site!("Failed to acquire Bluetooth state lock"))?;
+                let mut addrs = st.connected_device_info.keys().cloned().collect::<Vec<_>>();
+                for addr in st
+                    .on_connected_callbacks
+                    .keys()
+                    .chain(st.data_listener_callbacks.keys())
+                {
+                    if !addrs.contains(addr) {
+                        addrs.push(addr.clone());
+                    }
+                }
+                addrs
+            };
+            MAIN_THREAD_STATE.with(|cell| {
+                let state = cell.borrow();
+                for addr in state
+                    .rfcomm_channels
+                    .keys()
+                    .chain(state.pending_sends.keys())
+                {
+                    if !addrs.contains(addr) {
+                        addrs.push(addr.clone());
+                    }
+                }
+            });
+            for addr in addrs {
+                disconnect_addr_on_main_thread(&addr)?;
+            }
+            audio_guard::stop_all();
             Ok(())
         })
     }
@@ -760,6 +899,6 @@ pub mod core {
 
 /* ---------- 全局清理 --------- */
 pub fn cleanup_bluetooth_resources() {
-    let _ = core::disconnect_impl();
+    let _ = core::disconnect_all_impl();
     let _ = core::stop_scan_impl();
 }

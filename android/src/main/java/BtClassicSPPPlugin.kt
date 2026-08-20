@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 
 @InvokeArg
 class ConnectArg {
@@ -24,6 +25,9 @@ class ConnectArg {
 class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     private lateinit var implementation: BTSpp
     private lateinit var webView: WebView
+    // Every address-scoped command gets a separate BTSpp, including its
+    // socket/GATT, streams, callbacks, reader and send mutex.
+    private val sessions = ConcurrentHashMap<String, BTSpp>()
 
     override fun load(webView: WebView) {
         implementation = BTSpp(activity, webView)
@@ -31,8 +35,27 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
         this.webView = webView
     }
 
+    private fun normalizeAddress(address: String): String {
+        val raw = address.trim()
+        val hex = raw.filter { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+        if (hex.length >= 12) {
+            return hex.takeLast(12)
+                .chunked(2)
+                .joinToString(":") { it.uppercase(java.util.Locale.US) }
+        }
+        return raw.uppercase(java.util.Locale.US)
+    }
+
+    private fun sessionFor(address: String): BTSpp {
+        val key = normalizeAddress(address)
+        return sessions.computeIfAbsent(key) {
+            BTSpp(activity, webView).also { it.initPermissions() }
+        }
+    }
+
     override fun onResume() {
         implementation.onHostResume()
+        sessions.values.forEach { it.onHostResume() }
     }
 
     /** ------------ 蓝牙扫描 ------------ **/
@@ -93,19 +116,18 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun connect(invoke: Invoke) {
         val args = invoke.parseArgs(ConnectArg::class.java)
+        val session = sessionFor(args.addr)
         webView.evaluateJavascript("console.log('Kotlin: Connecting to device ${args.addr}')", null)
 
         CoroutineScope(Dispatchers.IO).launch {
-            val (isSuccessful, err) = implementation.connect(
+            val (isSuccessful, err) = session.connect(
                 activity,
                 args.addr,
                 args.remove_bond,
                 args.fallback_channels.toList(),
             )
             if (isSuccessful) {
-                val ret = JSObject()
-                ret.put("ret", true)
-                invoke.resolve(ret)
+                invoke.resolve(JSObject().put("ret", true))
             } else {
                 invoke.reject("CONNECT_ERROR", err ?: "Unknown error")
             }
@@ -115,10 +137,11 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun connectBle(invoke: Invoke) {
         val args = invoke.parseArgs(ConnectArg::class.java)
+        val session = sessionFor(args.addr)
         webView.evaluateJavascript("console.log('Kotlin: BLE connecting to device ${args.addr}')", null)
 
         CoroutineScope(Dispatchers.IO).launch {
-            val (isSuccessful, err) = implementation.connectBle(args.addr)
+            val (isSuccessful, err) = session.connectBle(args.addr)
             if (isSuccessful) {
                 invoke.resolve(JSObject().put("ret", true))
             } else {
@@ -129,21 +152,25 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun disconnect(invoke: Invoke) {
-        implementation.disconnect()
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
+        sessionFor(args.addr).disconnect()
         invoke.resolve()
     }
 
     @Command
     fun disconnectBle(invoke: Invoke) {
-        implementation.disconnectBle()
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
+        sessionFor(args.addr).disconnectBle()
         invoke.resolve()
     }
 
     /** ------------ 连接成功回调 ------------ **/
     @Command
     fun onConnected(invoke: Invoke) {
-        val out = invoke.parseArgs(Channel::class.java)
-        implementation.onConnected { out.send(JSObject()) }
+        val args = invoke.parseArgs(RustTypes.AddressChannelArg::class.java)
+        sessionFor(args.addr).onConnected {
+            args.channel.send(JSObject().put("addr", args.addr))
+        }
         invoke.resolve()
     }
 
@@ -151,8 +178,10 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     @SuppressLint("MissingPermission")
     @Command
     fun getConnectedDeviceInfo(invoke: Invoke) {
-        val info = implementation.getConnectedDeviceInfo()
-        val ret = JSObject()
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
+        val session = sessionFor(args.addr)
+        val info = session.getConnectedDeviceInfo() ?: session.getBleConnectedDeviceInfo()
+        val ret = JSObject().put("addr", args.addr)
         info?.let {
             ret.put("name", it.name)
             ret.put("address", it.address)
@@ -162,33 +191,43 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun getMaxSendLen(invoke: Invoke) {
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
         val ret = JSObject()
-        ret.put("ret", implementation.getMaxSendLen())
+            .put("addr", args.addr)
+            .put("ret", sessionFor(args.addr).getMaxSendLen())
         invoke.resolve(ret)
     }
 
     @Command
     fun getBleMaxSendLen(invoke: Invoke) {
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
         val ret = JSObject()
-        ret.put("ret", implementation.getBleMaxSendLen())
+            .put("addr", args.addr)
+            .put("ret", sessionFor(args.addr).getBleMaxSendLen())
         invoke.resolve(ret)
     }
 
     /** ------------ 数据监听 ------------ **/
     @Command
     fun setDataListener(invoke: Invoke) {
-        val out = invoke.parseArgs(Channel::class.java)
-        val callbackData = JSObject()
-        implementation.setDataListener(object : BTSpp.DataListener {
+        val args = invoke.parseArgs(RustTypes.AddressChannelArg::class.java)
+        val address = args.addr
+        sessionFor(address).setDataListener(object : BTSpp.DataListener {
             override fun onDataReceived(data: ByteArray) {
-                callbackData.put("ret", Base64.encodeToString(data, Base64.NO_WRAP))
-                out.send(callbackData)
+                args.channel.send(
+                    JSObject()
+                        .put("addr", address)
+                        .put("ret", Base64.encodeToString(data, Base64.NO_WRAP))
+                )
             }
 
             override fun onError(e: IOException) {
-                callbackData.put("ret", "")
-                callbackData.put("err", e.toString())
-                out.send(callbackData)
+                args.channel.send(
+                    JSObject()
+                        .put("addr", address)
+                        .put("ret", "")
+                        .put("err", e.toString())
+                )
             }
         })
         invoke.resolve()
@@ -197,14 +236,17 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     /** ------------ 开启订阅读取 ------------ **/
     @Command
     fun startSubscription(invoke: Invoke) {
-        implementation.startSubscription()
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
+        sessionFor(args.addr).startSubscription()
         invoke.resolve()
     }
 
     @Command
     fun startBleSubscription(invoke: Invoke) {
+        val args = invoke.parseArgs(RustTypes.AddressArg::class.java)
+        val session = sessionFor(args.addr)
         CoroutineScope(Dispatchers.IO).launch {
-            val (isSuccessful, err) = implementation.startBleSubscription()
+            val (isSuccessful, err) = session.startBleSubscription()
             if (isSuccessful) {
                 invoke.resolve()
             } else {
@@ -216,18 +258,19 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     /** ------------ 发送 ------------ **/
     @Command
     fun send(invoke: Invoke) {
-        val args = invoke.parseArgs(RustTypes.SPPSendPayload::class.java)
+        val args = invoke.parseArgs(RustTypes.AddressSendPayload::class.java)
         val data = Base64.decode(args.b64data, Base64.DEFAULT)
-        implementation.send(data)
+        sessionFor(args.addr).send(data)
         invoke.resolve()
     }
 
     @Command
     fun sendBle(invoke: Invoke) {
-        val args = invoke.parseArgs(RustTypes.SPPSendPayload::class.java)
+        val args = invoke.parseArgs(RustTypes.AddressSendPayload::class.java)
         val data = Base64.decode(args.b64data, Base64.DEFAULT)
+        val session = sessionFor(args.addr)
         CoroutineScope(Dispatchers.IO).launch {
-            val (isSuccessful, err) = implementation.sendBle(data)
+            val (isSuccessful, err) = session.sendBle(data)
             if (isSuccessful) {
                 invoke.resolve()
             } else {
