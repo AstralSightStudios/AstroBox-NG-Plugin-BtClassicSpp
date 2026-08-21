@@ -2,6 +2,7 @@ package com.astralsight.astrobox.plugin.btclassic_spp
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.os.Looper
 import android.util.Base64
 import android.webkit.WebView
 import app.tauri.annotation.Command
@@ -25,6 +26,19 @@ class ConnectArg {
 class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     private lateinit var implementation: BTSpp
     private lateinit var webView: WebView
+
+    private enum class ScanKind {
+        SPP,
+        BLE,
+    }
+
+    private data class PendingScan(
+        val kind: ScanKind,
+        val invoke: Invoke,
+    )
+
+    @Volatile private var pendingScan: PendingScan? = null
+
     // Every address-scoped command gets a separate BTSpp, including its
     // socket/GATT, streams, callbacks, reader and send mutex.
     private val sessions = ConcurrentHashMap<String, BTSpp>()
@@ -53,15 +67,86 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     /** ------------ 蓝牙扫描 ------------ **/
+    private fun startScan(kind: ScanKind, invoke: Invoke) {
+        val started = when (kind) {
+            ScanKind.SPP -> implementation.startScan()
+            ScanKind.BLE -> implementation.startBleScan()
+        }
+        if (started) {
+            invoke.resolve()
+            return
+        }
+
+        val missing = implementation.missingRuntimePermissions(forScan = true)
+        if (missing.isEmpty()) {
+            invoke.reject("SCAN_START_ERROR", "Unable to start Bluetooth scan")
+            return
+        }
+        if (pendingScan != null) {
+            invoke.reject("PERMISSION_REQUEST_IN_PROGRESS", "Bluetooth permission request is already in progress")
+            return
+        }
+
+        pendingScan = PendingScan(kind, invoke)
+        val request = {
+            try {
+                PluginManager.requestPermissions(missing) { _ ->
+                    completePendingScan()
+                }
+            } catch (error: Exception) {
+                val pending = pendingScan
+                pendingScan = null
+                pending?.invoke?.reject(
+                    "PERMISSION_REQUEST_ERROR",
+                    error.message ?: "Unable to request Bluetooth permissions",
+                )
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            request()
+        } else {
+            activity.runOnUiThread { request() }
+        }
+    }
+
+    private fun completePendingScan() {
+        val pending = pendingScan ?: return
+        pendingScan = null
+
+        if (!implementation.hasRuntimePermissions(forScan = true)) {
+            pending.invoke.reject(
+                "BLUETOOTH_PERMISSION_DENIED",
+                "Bluetooth scan permission was not granted",
+            )
+            return
+        }
+
+        val started = when (pending.kind) {
+            ScanKind.SPP -> implementation.startScan()
+            ScanKind.BLE -> implementation.startBleScan()
+        }
+        if (started) {
+            pending.invoke.resolve()
+        } else {
+            pending.invoke.reject("SCAN_START_ERROR", "Unable to start Bluetooth scan")
+        }
+    }
+
+    private fun cancelPendingScan() {
+        val pending = pendingScan ?: return
+        pendingScan = null
+        pending.invoke.reject("SCAN_CANCELLED", "Bluetooth scan was cancelled")
+    }
+
     @SuppressLint("MissingPermission")
     @Command
     fun startScan(invoke: Invoke) {
-        implementation.startScan()
-        invoke.resolve()
+        startScan(ScanKind.SPP, invoke)
     }
 
     @Command
     fun stopScan(invoke: Invoke) {
+        cancelPendingScan()
         implementation.stopScan()
         invoke.resolve()
     }
@@ -83,12 +168,12 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     @SuppressLint("MissingPermission")
     @Command
     fun startBleScan(invoke: Invoke) {
-        implementation.startBleScan()
-        invoke.resolve()
+        startScan(ScanKind.BLE, invoke)
     }
 
     @Command
     fun stopBleScan(invoke: Invoke) {
+        cancelPendingScan()
         implementation.stopBleScan()
         invoke.resolve()
     }

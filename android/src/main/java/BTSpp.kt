@@ -139,6 +139,15 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             .toTypedArray()
     }
 
+    fun missingRuntimePermissions(forScan: Boolean): Array<String> {
+        val activity = context as? Activity
+            ?: throw IllegalStateException("需要传入 Activity 作为 context，才能检查运行时权限。")
+        return missingRuntimePermissions(activity, forScan)
+    }
+
+    fun hasRuntimePermissions(forScan: Boolean): Boolean =
+        missingRuntimePermissions(forScan).isEmpty()
+
     private fun hasLocationPermission(activity: Activity): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return true
         val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -343,20 +352,20 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startScan() {
-        if (!ensureRuntimePermissionsForUse(forScan = true)) return
-        scannedDevices.clear()
-        adapter?.let { bt ->
-            if (bt.isDiscovering) bt.cancelDiscovery()
+    fun startScan(): Boolean {
+        if (!hasRuntimePermissions(forScan = true)) return false
+        val bt = adapter ?: return false
 
-            val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(scanReceiver, filter, RECEIVER_EXPORTED)
-            } else {
-                context.registerReceiver(scanReceiver, filter)
-            }
-            bt.startDiscovery()
+        scannedDevices.clear()
+        if (bt.isDiscovering) bt.cancelDiscovery()
+
+        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(scanReceiver, filter, RECEIVER_EXPORTED)
+        } else {
+            context.registerReceiver(scanReceiver, filter)
         }
+        return bt.startDiscovery()
     }
 
     @SuppressLint("MissingPermission")
@@ -366,14 +375,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startBleScan() {
-        if (!ensureRuntimePermissionsForUse(forScan = true)) return
+    fun startBleScan(): Boolean {
+        if (!hasRuntimePermissions(forScan = true)) return false
 
         stopBleScan()
         synchronized(bleScannedDevices) { bleScannedDevices.clear() }
         synchronized(bleDeviceCache) { bleDeviceCache.clear() }
 
-        val scanner = adapter?.bluetoothLeScanner ?: return
+        val scanner = adapter?.bluetoothLeScanner ?: return false
         val callback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
                 rememberBleScanResult(result)
@@ -398,6 +407,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             .build()
         bleScanCallback = callback
         scanner.startScan(emptyList<ScanFilter>(), settings, callback)
+        return true
     }
 
     @SuppressLint("MissingPermission")
