@@ -31,7 +31,6 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
 
     override fun load(webView: WebView) {
         implementation = BTSpp(activity, webView)
-        implementation.initPermissions()
         this.webView = webView
     }
 
@@ -49,13 +48,8 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     private fun sessionFor(address: String): BTSpp {
         val key = normalizeAddress(address)
         return sessions.computeIfAbsent(key) {
-            BTSpp(activity, webView).also { it.initPermissions() }
+            BTSpp(activity, webView)
         }
-    }
-
-    override fun onResume() {
-        implementation.onHostResume()
-        sessions.values.forEach { it.onHostResume() }
     }
 
     /** ------------ 蓝牙扫描 ------------ **/

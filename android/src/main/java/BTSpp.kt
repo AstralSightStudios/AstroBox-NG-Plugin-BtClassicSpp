@@ -67,11 +67,13 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private val PERMISSION_REQUEST_CODE = 1001
     private val PERMISSION_REQUEST_COOLDOWN_MS = 1500L
     private val PRECISE_LOCATION_REQUIRED_MESSAGE =
-        "请授予AstroBox访问您的精确位置，否则将无法连接到任何蓝牙设备，此为安卓系统硬性要求。"
-    private val PRECISE_LOCATION_DIALOG_COOLDOWN_MS = 3000L
+        "请授予AstroBox访问您的位置，否则将无法扫描蓝牙设备，此为安卓系统要求。"
+    private val BLUETOOTH_PERMISSION_REQUIRED_MESSAGE =
+        "请授予AstroBox访问附近设备的权限，否则将无法连接到任何蓝牙设备。"
+    private val PERMISSION_DIALOG_COOLDOWN_MS = 3000L
     @Volatile private var lastPermissionRequestAtMs: Long = 0L
-    @Volatile private var lastPreciseLocationDialogAtMs: Long = 0L
-    @Volatile private var pendingStartupPermissionCheck: Boolean = false
+    @Volatile private var lastPermissionDialogAtMs: Long = 0L
+    @Volatile private var hasRequestedRuntimePermissions: Boolean = false
 
     private val adapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private val scannedDevices = mutableListOf<BluetoothDevice>()
@@ -111,24 +113,25 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     @Volatile private var readThread: Thread? = null
     private val uiHandler = Handler(Looper.getMainLooper())
 
-    private fun requiredRuntimePermissions(): Array<String> {
+    private fun requiredRuntimePermissions(forScan: Boolean): Array<String> {
         return when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> arrayOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT,
-                Manifest.permission.ACCESS_FINE_LOCATION,
-            )
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> arrayOf(
-                Manifest.permission.ACCESS_FINE_LOCATION,
-            )
-            else -> arrayOf(
-                Manifest.permission.ACCESS_COARSE_LOCATION,
-            )
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                val permissions = mutableListOf<String>()
+                if (forScan) permissions += Manifest.permission.BLUETOOTH_SCAN
+                permissions += Manifest.permission.BLUETOOTH_CONNECT
+                permissions.toTypedArray()
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                if (forScan) arrayOf(Manifest.permission.ACCESS_FINE_LOCATION) else emptyArray()
+            }
+            else -> {
+                if (forScan) arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION) else emptyArray()
+            }
         }
     }
 
-    private fun missingRuntimePermissions(activity: Activity): Array<String> {
-        return requiredRuntimePermissions()
+    private fun missingRuntimePermissions(activity: Activity, forScan: Boolean): Array<String> {
+        return requiredRuntimePermissions(forScan)
             .distinct()
             .filter {
                 ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
@@ -136,17 +139,21 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             .toTypedArray()
     }
 
-    private fun hasPreciseLocationPermission(activity: Activity): Boolean {
-        return ContextCompat.checkSelfPermission(
-            activity,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-        ) == PackageManager.PERMISSION_GRANTED
+    private fun hasLocationPermission(activity: Activity): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return true
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        } else {
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        }
+        return ContextCompat.checkSelfPermission(activity, permission) ==
+            PackageManager.PERMISSION_GRANTED
     }
 
-    private fun ensureRuntimePermissions(requestIfMissing: Boolean): Boolean {
+    private fun ensureRuntimePermissions(requestIfMissing: Boolean, forScan: Boolean): Boolean {
         val activity = context as? Activity
             ?: throw IllegalStateException("需要传入 Activity 作为 context，才能申请运行时权限。")
-        val missing = missingRuntimePermissions(activity)
+        val missing = missingRuntimePermissions(activity, forScan)
         if (missing.isEmpty()) return true
         if (!requestIfMissing) return false
         val now = System.currentTimeMillis()
@@ -154,6 +161,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             return false
         }
         lastPermissionRequestAtMs = now
+        hasRequestedRuntimePermissions = true
 
         val request = {
             ActivityCompat.requestPermissions(activity, missing, PERMISSION_REQUEST_CODE)
@@ -166,18 +174,49 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         return false
     }
 
-    private fun showPreciseLocationRequiredDialogIfNeeded() {
-        val activity = context as? Activity ?: return
-        if (hasPreciseLocationPermission(activity)) return
+    /** Request permissions only after a user-initiated Bluetooth operation. */
+    private fun ensureRuntimePermissionsForUse(forScan: Boolean): Boolean {
+        val activity = context as? Activity
+            ?: throw IllegalStateException("需要传入 Activity 作为 context，才能申请运行时权限。")
+        if (ensureRuntimePermissions(requestIfMissing = false, forScan = forScan)) return true
+
+        val missing = missingRuntimePermissions(activity, forScan)
+        if (missing.isEmpty()) return true
+
         val now = System.currentTimeMillis()
-        if (now - lastPreciseLocationDialogAtMs < PRECISE_LOCATION_DIALOG_COOLDOWN_MS) {
+        if (now - lastPermissionRequestAtMs < PERMISSION_REQUEST_COOLDOWN_MS) {
+            return false
+        }
+
+        val canRequestAgain = !hasRequestedRuntimePermissions || missing.any {
+            ActivityCompat.shouldShowRequestPermissionRationale(activity, it)
+        }
+        if (canRequestAgain) {
+            ensureRuntimePermissions(requestIfMissing = true, forScan = forScan)
+        } else {
+            showPermissionRequiredDialogIfNeeded(forScan)
+        }
+        return false
+    }
+
+    private fun showPermissionRequiredDialogIfNeeded(forScan: Boolean) {
+        val activity = context as? Activity ?: return
+        val missing = missingRuntimePermissions(activity, forScan)
+        if (missing.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - lastPermissionDialogAtMs < PERMISSION_DIALOG_COOLDOWN_MS) {
             return
         }
-        lastPreciseLocationDialogAtMs = now
+        lastPermissionDialogAtMs = now
 
+        val message = if (forScan && !hasLocationPermission(activity)) {
+            PRECISE_LOCATION_REQUIRED_MESSAGE
+        } else {
+            BLUETOOTH_PERMISSION_REQUIRED_MESSAGE
+        }
         val showDialog = {
             android.app.AlertDialog.Builder(activity)
-                .setMessage(PRECISE_LOCATION_REQUIRED_MESSAGE)
+                .setMessage(message)
                 .setCancelable(true)
                 .setPositiveButton("去设置") { _, _ ->
                     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
@@ -196,26 +235,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         }
     }
 
-    fun onHostResume() {
-        if (!pendingStartupPermissionCheck) return
-        val now = System.currentTimeMillis()
-        if (now - lastPermissionRequestAtMs < PERMISSION_REQUEST_COOLDOWN_MS) {
-            return
-        }
-        pendingStartupPermissionCheck = false
-        val granted = ensureRuntimePermissions(requestIfMissing = false)
-        if (!granted) {
-            showPreciseLocationRequiredDialogIfNeeded()
-        }
-    }
-
-    private fun missingPermissionsMessage(): String {
-        val activity = context as? Activity ?: return PRECISE_LOCATION_REQUIRED_MESSAGE
-        if (!hasPreciseLocationPermission(activity)) {
+    private fun missingPermissionsMessage(forScan: Boolean): String {
+        val activity = context as? Activity
+            ?: return BLUETOOTH_PERMISSION_REQUIRED_MESSAGE
+        if (forScan && !hasLocationPermission(activity)) {
             return PRECISE_LOCATION_REQUIRED_MESSAGE
         }
-        val missing = missingRuntimePermissions(activity)
-        if (missing.isEmpty()) return PRECISE_LOCATION_REQUIRED_MESSAGE
+        val missing = missingRuntimePermissions(activity, forScan)
+        if (missing.isEmpty()) return BLUETOOTH_PERMISSION_REQUIRED_MESSAGE
         return "Missing permissions: ${missing.joinToString(", ")}"
     }
 
@@ -238,10 +265,6 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         return (bleMtu - 3).coerceAtLeast(20)
     }
     fun setDataListener(listener: DataListener) { dataListener = listener }
-
-    fun initPermissions() {
-        pendingStartupPermissionCheck = !ensureRuntimePermissions(requestIfMissing = true)
-    }
 
     private suspend fun webViewLog(content: String) {
         withContext(Dispatchers.Main) {
@@ -321,10 +344,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     @SuppressLint("MissingPermission")
     fun startScan() {
-        if (!ensureRuntimePermissions(requestIfMissing = false)) {
-            showPreciseLocationRequiredDialogIfNeeded()
-            return
-        }
+        if (!ensureRuntimePermissionsForUse(forScan = true)) return
         scannedDevices.clear()
         adapter?.let { bt ->
             if (bt.isDiscovering) bt.cancelDiscovery()
@@ -347,10 +367,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
     @SuppressLint("MissingPermission")
     fun startBleScan() {
-        if (!ensureRuntimePermissions(requestIfMissing = false)) {
-            showPreciseLocationRequiredDialogIfNeeded()
-            return
-        }
+        if (!ensureRuntimePermissionsForUse(forScan = true)) return
 
         stopBleScan()
         synchronized(bleScannedDevices) { bleScannedDevices.clear() }
@@ -420,9 +437,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     ): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
         var errMsg: String?
         try {
-            if (!ensureRuntimePermissions(requestIfMissing = false)) {
-                showPreciseLocationRequiredDialogIfNeeded()
-                errMsg = missingPermissionsMessage()
+            if (!ensureRuntimePermissionsForUse(forScan = false)) {
+                errMsg = missingPermissionsMessage(forScan = false)
                 return@withContext false to errMsg
             }
 
@@ -517,9 +533,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         context: Context,
         timeoutMs: Long = 15_000L
     ) {
-        if (!ensureRuntimePermissions(requestIfMissing = false)) {
-            showPreciseLocationRequiredDialogIfNeeded()
-            throw IOException(missingPermissionsMessage())
+        if (!ensureRuntimePermissionsForUse(forScan = false)) {
+            throw IOException(missingPermissionsMessage(forScan = false))
         }
 
         if (bondState == BluetoothDevice.BOND_BONDED) return
@@ -755,9 +770,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     @SuppressLint("MissingPermission")
     suspend fun connectBle(address: String): Pair<Boolean, String?> = withContext(Dispatchers.IO) {
         try {
-            if (!ensureRuntimePermissions(requestIfMissing = false)) {
-                showPreciseLocationRequiredDialogIfNeeded()
-                return@withContext false to missingPermissionsMessage()
+            if (!ensureRuntimePermissionsForUse(forScan = true)) {
+                return@withContext false to missingPermissionsMessage(forScan = true)
             }
 
             val dev = resolveBleDevice(address)
