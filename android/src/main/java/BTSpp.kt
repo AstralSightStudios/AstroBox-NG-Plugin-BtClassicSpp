@@ -508,7 +508,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                         outStream?.write(payload)
                         outStream?.flush()
                     } catch (e: IOException) {
-                        uiHandler.post { dataListener?.onError(e) }
+                        val listener = dataListener
+                        uiHandler.post { listener?.onError(e) }
                         break
                     }
                 }
@@ -646,8 +647,9 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                     bleConnectDeferred?.complete(false)
                     bleConnectDeferred = null
                     if (!bleManualDisconnect && bleConnectedDevice != null) {
+                        val listener = dataListener
                         uiHandler.post {
-                            dataListener?.onError(IOException("BLE disconnected: status=$status"))
+                            listener?.onError(IOException("BLE disconnected: status=$status"))
                         }
                     }
                     bleConnectedDevice = null
@@ -913,14 +915,11 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     @OptIn(ExperimentalCoroutinesApi::class)
     fun send(data: ByteArray): Boolean {
         val actor = sendActor
-        return if (actor != null && !actor.isClosedForSend) {
-            actor.trySend(data).isSuccess
-        } else {
-            // 未连接：先缓存，待连接后一次性冲刷
-            // 我觉得rust层也不会傻逼到没连上设备就发包？maybe？
-            pendingPool.add(data)
-            true
+        val currentSocket = socket
+        if (actor == null || actor.isClosedForSend || currentSocket == null || !currentSocket.isConnected) {
+            return false
         }
+        return actor.trySend(data).isSuccess
     }
 
     fun startSubscription() {
@@ -928,10 +927,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         val reader = Thread {
             val currentThread = Thread.currentThread()
             val buf = ByteArray(1024)
+            var disconnectError: IOException? = null
             try {
                 while (readThread === currentThread && !currentThread.isInterrupted) {
                     val len = inStream?.read(buf) ?: break
-                    if (len <= 0) break
+                    if (len <= 0) {
+                        disconnectError = IOException("Connection closed by peer")
+                        break
+                    }
                     val bytes = buf.copyOf(len)
                     if (readThread === currentThread) {
                         uiHandler.post {
@@ -942,15 +945,14 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                     }
                 }
             } catch (e: IOException) {
-                if (readThread === currentThread) {
-                    uiHandler.post {
-                        if (readThread === currentThread) {
-                            dataListener?.onError(e)
-                        }
-                    }
-                }
+                disconnectError = e
             } finally {
                 if (readThread === currentThread) {
+                    val listener = dataListener
+                    val err = disconnectError ?: IOException("Connection closed by peer")
+                    uiHandler.post {
+                        listener?.onError(err)
+                    }
                     disconnect()
                 }
             }

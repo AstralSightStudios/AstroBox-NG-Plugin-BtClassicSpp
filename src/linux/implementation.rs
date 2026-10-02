@@ -515,14 +515,17 @@ pub mod core {
                 }
             }
 
-            // Do not let a completed reader prevent a later subscription.  The
-            // pointer check prevents an old reader from touching a replacement
-            // connection for the same address.
+            // Do not let a completed reader prevent a later subscription or leave
+            // a dead connection open. If this reader owned the current connection,
+            // tear it down so subsequent send operations fail immediately.
             let mut st = state_clone.lock().unwrap();
-            if let Some(connection) = st.connections.get_mut(&addr_for_task) {
-                if Arc::ptr_eq(&connection.socket_stream, &socket_for_task) {
-                    connection.read_thread = None;
-                    connection.read_stop = None;
+            let should_remove = st
+                .connections
+                .get(&addr_for_task)
+                .is_some_and(|c| Arc::ptr_eq(&c.socket_stream, &socket_for_task));
+            if should_remove {
+                if let Some(conn) = st.connections.remove(&addr_for_task) {
+                    stop_connection(conn);
                 }
             }
         });

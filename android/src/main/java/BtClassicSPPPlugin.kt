@@ -339,8 +339,12 @@ class BtClassicSPPPlugin(private val activity: Activity) : Plugin(activity) {
     fun send(invoke: Invoke) {
         val args = invoke.parseArgs(RustTypes.AddressSendPayload::class.java)
         val data = Base64.decode(args.b64data, Base64.DEFAULT)
-        sessionFor(args.addr).send(data)
-        invoke.resolve()
+        val session = sessionFor(args.addr)
+        if (session.send(data)) {
+            invoke.resolve()
+        } else {
+            invoke.reject("SEND_ERROR", "Device ${args.addr} not connected or SPP send failed")
+        }
     }
 
     @Command
