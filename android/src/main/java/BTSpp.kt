@@ -481,6 +481,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 try {
                     dev.awaitBonded(context)
                     webViewLog("Kotlin: Bond successful!")
+                    delay(500)
                 } catch (e: Exception) {
                     errMsg = "Bond failed: ${e.message}"
                     return@withContext false to errMsg
@@ -491,7 +492,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             if (sock == null) {
                 val channels = fallbackChannels.ifEmpty { listOf(5, 1) }.distinct()
                 for (channel in channels) {
-                    sock = tryChannel(dev, channel, if (channel == 5) 3_000 else 2_000)
+                    sock = tryChannel(dev, channel, if (channel == 5) 8_000 else 6_000)
                     if (sock != null) break
                 }
             }
@@ -550,8 +551,6 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
         if (bondState == BluetoothDevice.BOND_BONDED) return
 
-        if (!createBond()) throw IOException("createBond() failed")
-
         withTimeout(timeoutMs) {
             suspendCancellableCoroutine<Unit> { cont ->
                 val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
@@ -562,7 +561,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                             BluetoothDevice.EXTRA_DEVICE
                         )
                         if (dev == null) {
-                            throw NullPointerException("Device is null!!! 操你妈的怎么会出这种奇怪的问题")
+                            throw NullPointerException("Device is null")
                         }
                         if (dev.address != address) return
                         when (dev.bondState) {
@@ -579,6 +578,11 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 }
                 context.registerReceiver(receiver, filter)
                 cont.invokeOnCancellation { context.unregisterReceiver(receiver) }
+
+                if (!createBond()) {
+                    context.unregisterReceiver(receiver)
+                    cont.resumeWithException(IOException("createBond() failed"))
+                }
             }
         }
     }
@@ -593,18 +597,34 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 ?.firstOrNull { it.uuid.toString().startsWith(SPP_PREFIX, ignoreCase = true) }
                 ?.let { parcel ->
                     /* insecure 优先，部分国产 ROM 只允许 insecure 连接 */
-                    runCatching {
+                    val insecureResult = runCatching {
                         webViewLog("Kotlin: trySdpUuid (insecure, uuid=${parcel.uuid})")
                         val sock = dev.createInsecureRfcommSocketToServiceRecord(parcel.uuid)
-                        withTimeout(6_000) { sock.connect() }
-                        return sock
-                    }.onFailure {
-                        webViewLog("Kotlin: insecure failed, fallback secure")
+                        try {
+                            withTimeout(6_000) { sock.connect() }
+                            sock
+                        } catch (e: Exception) {
+                            runCatching { sock.close() }
+                            throw e
+                        }
                     }
-                    runCatching {
+                    if (insecureResult.isSuccess) {
+                        return insecureResult.getOrNull()
+                    }
+                    webViewLog("Kotlin: insecure failed, fallback secure")
+
+                    val secureResult = runCatching {
                         val sock = dev.createRfcommSocketToServiceRecord(parcel.uuid) // secure
-                        withTimeout(6_000) { sock.connect() }
-                        return sock
+                        try {
+                            withTimeout(6_000) { sock.connect() }
+                            sock
+                        } catch (e: Exception) {
+                            runCatching { sock.close() }
+                            throw e
+                        }
+                    }
+                    if (secureResult.isSuccess) {
+                        return secureResult.getOrNull()
                     }
                 }
             delay(100)
@@ -625,8 +645,13 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             }.getOrNull() ?: dev.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
 
             val sock = method.invoke(dev, ch) as BluetoothSocket
-            withTimeout(timeoutMs) { sock.connect() }
-            sock
+            try {
+                withTimeout(timeoutMs) { sock.connect() }
+                sock
+            } catch (e: Exception) {
+                runCatching { sock.close() }
+                throw e
+            }
         }.getOrNull()
     }
 
