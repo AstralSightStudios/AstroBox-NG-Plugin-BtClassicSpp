@@ -476,18 +476,6 @@ class BTSpp(private val context: Context, private val webView: WebView) {
                 unpairDevice(dev)
             }
 
-            if (dev.bondState != BluetoothDevice.BOND_BONDED) {
-                webViewLog("Kotlin: start bonding…")
-                try {
-                    dev.awaitBonded(context)
-                    webViewLog("Kotlin: Bond successful!")
-                    delay(500)
-                } catch (e: Exception) {
-                    errMsg = "Bond failed: ${e.message}"
-                    return@withContext false to errMsg
-                }
-            }
-
             var sock = trySdpUuid(dev)
             if (sock == null) {
                 val channels = fallbackChannels.ifEmpty { listOf(5, 1) }.distinct()
@@ -538,52 +526,6 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             uiHandler.post { cb() }
         } else {
             onConnectedCallback = cb
-        }
-    }
-
-    suspend fun BluetoothDevice.awaitBonded(
-        context: Context,
-        timeoutMs: Long = 15_000L
-    ) {
-        if (!ensureRuntimePermissionsForUse(forScan = false)) {
-            throw IOException(missingPermissionsMessage(forScan = false))
-        }
-
-        if (bondState == BluetoothDevice.BOND_BONDED) return
-
-        withTimeout(timeoutMs) {
-            suspendCancellableCoroutine<Unit> { cont ->
-                val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
-                val receiver = object : BroadcastReceiver() {
-                    @SuppressLint("MissingPermission")
-                    override fun onReceive(ctx: Context?, intent: Intent?) {
-                        val dev = intent?.getParcelableExtra<BluetoothDevice>(
-                            BluetoothDevice.EXTRA_DEVICE
-                        )
-                        if (dev == null) {
-                            throw NullPointerException("Device is null")
-                        }
-                        if (dev.address != address) return
-                        when (dev.bondState) {
-                            BluetoothDevice.BOND_BONDED -> {
-                                ctx?.unregisterReceiver(this)
-                                if (cont.isActive) cont.resume(Unit)
-                            }
-                            BluetoothDevice.BOND_NONE -> {
-                                ctx?.unregisterReceiver(this)
-                                if (cont.isActive) cont.resumeWithException(IOException("Bonding failed"))
-                            }
-                        }
-                    }
-                }
-                context.registerReceiver(receiver, filter)
-                cont.invokeOnCancellation { context.unregisterReceiver(receiver) }
-
-                if (!createBond()) {
-                    context.unregisterReceiver(receiver)
-                    cont.resumeWithException(IOException("createBond() failed"))
-                }
-            }
         }
     }
 
