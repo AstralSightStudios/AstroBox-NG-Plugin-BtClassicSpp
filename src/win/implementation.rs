@@ -13,13 +13,14 @@ use once_cell::sync::Lazy;
 use windows::core::{BOOL, GUID, PCWSTR};
 use windows::Win32::Devices::Bluetooth::{
     BluetoothAuthenticateDeviceEx, BluetoothFindDeviceClose, BluetoothFindFirstDevice,
-    BluetoothFindNextDevice, BluetoothGetDeviceInfo, BluetoothRegisterForAuthenticationEx,
-    BluetoothRemoveDevice, BluetoothSendAuthenticationResponseEx,
+    BluetoothFindFirstRadio, BluetoothFindNextDevice, BluetoothFindRadioClose, BluetoothGetDeviceInfo,
+    BluetoothRegisterForAuthenticationEx, BluetoothRemoveDevice, BluetoothSendAuthenticationResponseEx,
     BluetoothUnregisterAuthentication, MITMProtectionNotRequired, AF_BTH,
     BLUETOOTH_AUTHENTICATE_RESPONSE, BLUETOOTH_AUTHENTICATE_RESPONSE_0,
     BLUETOOTH_AUTHENTICATION_CALLBACK_PARAMS, BLUETOOTH_AUTHENTICATION_METHOD_LEGACY,
     BLUETOOTH_AUTHENTICATION_METHOD_NUMERIC_COMPARISON, BLUETOOTH_AUTHENTICATION_METHOD_PASSKEY,
-    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_NUMERIC_COMPARISON_INFO,
+    BLUETOOTH_DEVICE_INFO, BLUETOOTH_DEVICE_SEARCH_PARAMS, BLUETOOTH_FIND_RADIO_PARAMS,
+    BLUETOOTH_NUMERIC_COMPARISON_INFO,
     BLUETOOTH_PASSKEY_INFO, BLUETOOTH_PIN_INFO, HBLUETOOTH_DEVICE_FIND, SOCKADDR_BTH,
 };
 use windows::Win32::Foundation::{
@@ -173,6 +174,7 @@ struct GlobalState {
     wsa_initialized: bool,
     scanned_devices: Vec<SPPDevice>,
     is_scanning: bool,
+    scan_error: Option<String>,
     scan_stop_event: Option<Arc<OwnedHandle>>,
     scan_thread_handle: Option<thread::JoinHandle<()>>,
     // 每次 start/stop 扫描递增;旧扫描线程退出晚(inquiry 不可中断),
@@ -188,6 +190,7 @@ impl GlobalState {
             wsa_initialized: false,
             scanned_devices: Vec::new(),
             is_scanning: false,
+            scan_error: None,
             scan_stop_event: None,
             scan_thread_handle: None,
             scan_generation: 0,
@@ -417,6 +420,22 @@ pub mod core {
     pub fn start_scan_impl() -> Result<()> {
         init_winsock_if_needed()?;
         stop_scan_impl()?;
+        // WSAStartup succeeding does not imply that a Bluetooth radio exists.
+        // Fail before spawning a scan thread when Windows has no usable adapter.
+        let params = BLUETOOTH_FIND_RADIO_PARAMS {
+            dwSize: std::mem::size_of::<BLUETOOTH_FIND_RADIO_PARAMS>() as u32,
+        };
+        let mut radio_handle = HANDLE::default();
+        let radio_find_handle = unsafe { BluetoothFindFirstRadio(&params, &mut radio_handle) }.context(
+            "No accessible Windows Bluetooth radio; check the adapter, driver and radio state",
+        )?;
+        let radio_handle = OwnedHandle::new(radio_handle);
+        unsafe { BluetoothFindRadioClose(radio_find_handle) }
+            .context("Failed to close Bluetooth radio search")?;
+        if radio_handle.is_invalid() {
+            corelib::bail_site!("BluetoothFindFirstRadio returned an invalid radio handle");
+        }
+
         let state_clone_for_thread = Arc::clone(&BT_STATE);
         let mut state_guard = BT_STATE
             .lock()
@@ -427,6 +446,7 @@ pub mod core {
             return Ok(());
         }
         state_guard.scanned_devices.clear();
+        state_guard.scan_error = None;
 
         let stop_event_handle = create_manual_reset_event()?;
         state_guard.scan_stop_event = Some(Arc::clone(&stop_event_handle));
@@ -439,6 +459,7 @@ pub mod core {
         state_guard.scan_thread_handle = Some(thread::spawn(move || {
             let stop_event_handle = stop_event_for_thread.raw();
             const INQUIRY_CYCLE_PAUSE_MS: u32 = 3000;
+            let mut scan_error = None;
 
             'outer_scan_loop: loop {
                 let initial_wait_result = unsafe { WaitForSingleObject(stop_event_handle, 0) };
@@ -473,11 +494,18 @@ pub mod core {
                 let find_handle: HBLUETOOTH_DEVICE_FIND = match find_handle_result {
                     Ok(h) if !h.is_invalid() => h,
                     Ok(invalid_h) => {
-                        error!(
-                            "Continuous scan: BluetoothFindFirstDevice returned Ok with an invalid handle: {:?}. Win32 Error: {:?}. Pausing before retry.",
+                        let message = format!(
+                            "BluetoothFindFirstDevice returned an invalid handle: {:?}. Win32 Error: {:?}",
                             invalid_h,
                             unsafe { GetLastError() }
                         );
+                        error!("Continuous scan: {message}. Stopping discovery.");
+                        scan_error = Some(message);
+                        break 'outer_scan_loop;
+                    }
+                    Err(e) if e.code() == ERROR_NO_MORE_ITEMS.to_hresult() => {
+                        // An empty inquiry is normal; an unavailable radio is not.
+                        debug!("Continuous scan: No devices found in this inquiry cycle.");
                         let pause_wait = unsafe {
                             WaitForSingleObject(stop_event_handle, INQUIRY_CYCLE_PAUSE_MS)
                         };
@@ -487,18 +515,10 @@ pub mod core {
                         continue 'outer_scan_loop;
                     }
                     Err(e) => {
-                        error!(
-                            "Continuous scan: BluetoothFindFirstDevice failed. Error: {:?} (Win32: {:?}). Pausing before retry.",
-                            e,
-                            unsafe { GetLastError() }
-                        );
-                        let pause_wait = unsafe {
-                            WaitForSingleObject(stop_event_handle, INQUIRY_CYCLE_PAUSE_MS)
-                        };
-                        if pause_wait == WAIT_OBJECT_0 {
-                            break 'outer_scan_loop;
-                        }
-                        continue 'outer_scan_loop;
+                        let message = format!("BluetoothFindFirstDevice failed: {e:?}");
+                        error!("Continuous scan: {message}. Stopping discovery.");
+                        scan_error = Some(message);
+                        break 'outer_scan_loop;
                     }
                 };
                 let find_handle = DeviceFindHandle(find_handle);
@@ -537,11 +557,10 @@ pub mod core {
                                     "Continuous scan: BluetoothFindNextDevice: No more items in this cycle."
                                 );
                             } else {
-                                error!(
-                                    "Continuous scan: BluetoothFindNextDevice error: {:?} (Win32: {:?})",
-                                    e,
-                                    unsafe { GetLastError() }
-                                );
+                                let message = format!("BluetoothFindNextDevice failed: {e:?}");
+                                error!("Continuous scan: {message}. Stopping discovery.");
+                                scan_error = Some(message);
+                                break 'outer_scan_loop;
                             }
                             break 'inner_device_loop;
                         }
@@ -561,6 +580,7 @@ pub mod core {
             if let Ok(mut state_w) = state_clone_for_thread.lock() {
                 if state_w.scan_generation == scan_generation {
                     state_w.is_scanning = false;
+                    state_w.scan_error = scan_error;
                 }
             } else {
                 warn!("Failed to lock BT_STATE when scan thread finished");
@@ -619,6 +639,9 @@ pub mod core {
         let state = BT_STATE.lock().map_err(|_| {
             corelib::anyhow_site!("Failed to lock BT_STATE for get_scanned_devices")
         })?;
+        if let Some(error) = &state.scan_error {
+            corelib::bail_site!("Bluetooth discovery failed: {error}");
+        }
         Ok(state.scanned_devices.clone())
     }
 
