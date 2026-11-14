@@ -61,6 +61,15 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private val BLE_DEFAULT_MTU = 23
     private val BLE_REQUESTED_MTU = 247
     private val BLE_WRITE_DELAY_MS = 12L
+    /** GATT 一次只能有一个操作在途，写入起不来多半是上一个操作还没回调；短暂等一下再试 */
+    private val BLE_WRITE_BUSY_RETRIES = 50
+    private val BLE_WRITE_BUSY_RETRY_DELAY_MS = 10L
+    /** 读服务特征的等待上限：需要加密时系统会先弹配对，读请求压到配对结束才回来 */
+    private val BLE_SERVICE_PROBE_TIMEOUT_MS = 8_000L
+    /** GATT 连接立刻失败（典型是 status 133）时再试的次数；超时不重试 */
+    private val BLE_CONNECT_ATTEMPTS = 2
+    private val BLE_CONNECT_RETRY_DELAY_MS = 600L
+    private val UNPAIR_SETTLE_TIMEOUT_MS = 3_000L
     private val CLIENT_CHARACTERISTIC_CONFIG_UUID =
         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     private val STREAM_WRITE_HINT = 60 * 1024
@@ -103,6 +112,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
     private var bleServicesDeferred: CompletableDeferred<Boolean>? = null
     private var bleMtuDeferred: CompletableDeferred<Int>? = null
     private var bleDescriptorWriteDeferred: CompletableDeferred<Boolean>? = null
+    private var bleReadDeferred: CompletableDeferred<Boolean>? = null
     private val bleSendMutex = Mutex()
     @Volatile private var bleManualDisconnect: Boolean = false
 
@@ -424,10 +434,22 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         return withContext(Dispatchers.IO) {
             try {
                 webViewLog("Kotlin: Attempting to unpair device ${device.address} via reflection.")
+                if (device.bondState == BluetoothDevice.BOND_NONE) {
+                    return@withContext true
+                }
                 val method = device.javaClass.getMethod("removeBond")
                 val result = method.invoke(device) as? Boolean ?: false
                 if (result) {
                     webViewLog("Kotlin: removeBond() invoked successfully.")
+                    // removeBond 只是发起解绑，系统要过一会儿才真正清掉配对。紧接着就连的话，
+                    // 一部分 ROM 上 RFCOMM 会撞上正在拆的链路直接失败，或者再弹一次配对。
+                    val unbonded = withTimeoutOrNull(UNPAIR_SETTLE_TIMEOUT_MS) {
+                        while (device.bondState != BluetoothDevice.BOND_NONE) delay(100)
+                        true
+                    } == true
+                    if (!unbonded) {
+                        webViewLog("Kotlin: bond still present after removeBond(); connecting anyway.")
+                    }
                 } else {
                     webViewLog("Kotlin: removeBond() invocation failed.")
                 }
@@ -529,48 +551,77 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         }
     }
 
-    /** 通过 SDP UUID 尝试（secure + insecure） **/
+    /**
+     * 阻塞的 `BluetoothSocket.connect()` 带超时。`withTimeout` 打断不了阻塞调用（它只在挂起点检查
+     * 取消），以前写的 6 秒超时实际要等系统自己放弃（十几秒以上）。到点直接关掉 socket，
+     * `connect()` 会立刻抛 IOException 返回。
+     */
+    private suspend fun connectWithTimeout(sock: BluetoothSocket, timeoutMs: Long) {
+        coroutineScope {
+            // 显式放到 IO 线程池：调用方线程会被 connect() 阻塞住
+            val watchdog = launch(Dispatchers.IO) {
+                delay(timeoutMs)
+                runCatching { sock.close() }
+            }
+            try {
+                sock.connect()
+            } finally {
+                watchdog.cancel()
+            }
+        }
+        if (!sock.isConnected) {
+            throw IOException("RFCOMM connect timed out after ${timeoutMs}ms")
+        }
+    }
+
+    /** 通过 SDP UUID 尝试（insecure 一次 + secure 一次） **/
     @SuppressLint("MissingPermission")
     private suspend fun trySdpUuid(dev: BluetoothDevice): BluetoothSocket? {
         if (!dev.fetchUuidsWithSdp()) return null
 
-        repeat(20) {
-            dev.uuids
+        // 只是等 SDP 结果回来（最多 2 秒），不是重试连接。以前每一轮都把 insecure + secure 各连一次，
+        // 连不上就转 20 轮：最坏要好几分钟，而且每次 secure 连接都可能让系统再弹一次配对请求。
+        var uuid: UUID? = null
+        for (attempt in 0 until 20) {
+            uuid = dev.uuids
                 ?.firstOrNull { it.uuid.toString().startsWith(SPP_PREFIX, ignoreCase = true) }
-                ?.let { parcel ->
-                    /* insecure 优先，部分国产 ROM 只允许 insecure 连接 */
-                    val insecureResult = runCatching {
-                        webViewLog("Kotlin: trySdpUuid (insecure, uuid=${parcel.uuid})")
-                        val sock = dev.createInsecureRfcommSocketToServiceRecord(parcel.uuid)
-                        try {
-                            withTimeout(6_000) { sock.connect() }
-                            sock
-                        } catch (e: Exception) {
-                            runCatching { sock.close() }
-                            throw e
-                        }
-                    }
-                    if (insecureResult.isSuccess) {
-                        return insecureResult.getOrNull()
-                    }
-                    webViewLog("Kotlin: insecure failed, fallback secure")
-
-                    val secureResult = runCatching {
-                        val sock = dev.createRfcommSocketToServiceRecord(parcel.uuid) // secure
-                        try {
-                            withTimeout(6_000) { sock.connect() }
-                            sock
-                        } catch (e: Exception) {
-                            runCatching { sock.close() }
-                            throw e
-                        }
-                    }
-                    if (secureResult.isSuccess) {
-                        return secureResult.getOrNull()
-                    }
-                }
+                ?.uuid
+            if (uuid != null) break
             delay(100)
         }
+        val sppUuid = uuid ?: return null
+
+        /* insecure 优先，部分国产 ROM 只允许 insecure 连接 */
+        val insecureResult = runCatching {
+            webViewLog("Kotlin: trySdpUuid (insecure, uuid=$sppUuid)")
+            val sock = dev.createInsecureRfcommSocketToServiceRecord(sppUuid)
+            try {
+                connectWithTimeout(sock, 6_000)
+                sock
+            } catch (e: Exception) {
+                runCatching { sock.close() }
+                throw e
+            }
+        }
+        if (insecureResult.isSuccess) {
+            return insecureResult.getOrNull()
+        }
+        webViewLog("Kotlin: insecure failed (${insecureResult.exceptionOrNull()?.message}), fallback secure")
+
+        val secureResult = runCatching {
+            val sock = dev.createRfcommSocketToServiceRecord(sppUuid) // secure
+            try {
+                connectWithTimeout(sock, 6_000)
+                sock
+            } catch (e: Exception) {
+                runCatching { sock.close() }
+                throw e
+            }
+        }
+        if (secureResult.isSuccess) {
+            return secureResult.getOrNull()
+        }
+        webViewLog("Kotlin: secure failed (${secureResult.exceptionOrNull()?.message})")
         return null
     }
 
@@ -588,7 +639,7 @@ class BTSpp(private val context: Context, private val webView: WebView) {
 
             val sock = method.invoke(dev, ch) as BluetoothSocket
             try {
-                withTimeout(timeoutMs) { sock.connect() }
+                connectWithTimeout(sock, timeoutMs)
                 sock
             } catch (e: Exception) {
                 runCatching { sock.close() }
@@ -646,6 +697,28 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             if (gatt !== bleGatt) return
             bleDescriptorWriteDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
             bleDescriptorWriteDeferred = null
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (gatt !== bleGatt) return
+            bleReadDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+            bleReadDeferred = null
+        }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            if (gatt !== bleGatt) return
+            bleReadDeferred?.complete(status == BluetoothGatt.GATT_SUCCESS)
+            bleReadDeferred = null
         }
 
         @Deprecated("Deprecated in Java")
@@ -762,20 +835,36 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             onConnectedCallback = pendingOnConnected
             bleManualDisconnect = false
 
-            val connectedDeferred = CompletableDeferred<Boolean>()
-            bleConnectDeferred = connectedDeferred
-            val gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                dev.connectGatt(context, false, bleGattCallback, BluetoothDevice.TRANSPORT_LE)
-            } else {
-                dev.connectGatt(context, false, bleGattCallback)
-            } ?: return@withContext false to "connectGatt returned null"
+            // GATT 连接立刻失败（status 133 这类协议栈错误，安卓上很常见）时关掉这个 gatt 稍等再试一次；
+            // 15 秒都没连上说明设备不在附近，不再重试。
+            var connectedGatt: BluetoothGatt? = null
+            for (attempt in 1..BLE_CONNECT_ATTEMPTS) {
+                val connectedDeferred = CompletableDeferred<Boolean>()
+                bleConnectDeferred = connectedDeferred
+                val candidate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    dev.connectGatt(context, false, bleGattCallback, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    dev.connectGatt(context, false, bleGattCallback)
+                } ?: return@withContext false to "connectGatt returned null"
 
-            bleGatt = gatt
-            val connected = withTimeoutOrNull(15_000L) { connectedDeferred.await() } == true
-            if (!connected) {
+                bleGatt = candidate
+                val result = withTimeoutOrNull(15_000L) { connectedDeferred.await() }
+                if (result == true) {
+                    connectedGatt = candidate
+                    break
+                }
+                val pending = onConnectedCallback
                 disconnectBle()
-                return@withContext false to "BLE GATT connection timed out or failed"
+                onConnectedCallback = pending
+                if (result == null || attempt == BLE_CONNECT_ATTEMPTS) {
+                    onConnectedCallback = null
+                    return@withContext false to "BLE GATT connection timed out or failed"
+                }
+                webViewLog("Kotlin: BLE GATT connection failed immediately; retrying ($attempt/$BLE_CONNECT_ATTEMPTS)")
+                delay(BLE_CONNECT_RETRY_DELAY_MS)
             }
+            val gatt = connectedGatt
+                ?: return@withContext false to "BLE GATT connection timed out or failed"
 
             bleMtu = requestBleMtu(gatt)
 
@@ -836,11 +925,24 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             }
         }
 
+        // 等这次读真正回来再返回。GATT 一次只能有一个操作在途：以前读完不等就开始发协议包，
+        // 第一包写入常常因为读还在途而起不来（writeCharacteristic 返回失败），SAR 当成发送失败
+        // 整个会话重来。需要加密时系统会先弹配对，读要等配对结束才回来，也顺带让协议包等到配对之后。
+        // 读失败照旧继续：这一步一直是尽力而为。
         bleServiceProbeCharacteristic?.let { probe ->
-            runCatching {
+            val readDeferred = CompletableDeferred<Boolean>()
+            bleReadDeferred = readDeferred
+            val readStarted = runCatching {
                 @Suppress("DEPRECATION")
                 gatt.readCharacteristic(probe)
+            }.getOrDefault(false)
+            if (readStarted) {
+                val ok = withTimeoutOrNull(BLE_SERVICE_PROBE_TIMEOUT_MS) { readDeferred.await() }
+                if (ok != true) {
+                    webViewLog("Kotlin: BLE service probe read ${if (ok == null) "timed out" else "failed"}")
+                }
             }
+            if (bleReadDeferred === readDeferred) bleReadDeferred = null
         }
 
         true to null
@@ -858,17 +960,31 @@ class BTSpp(private val context: Context, private val webView: WebView) {
             }
 
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-            val writeStarted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(
-                    characteristic,
-                    data,
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                ) == BluetoothStatusCodes.SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                characteristic.value = data
-                @Suppress("DEPRECATION")
-                gatt.writeCharacteristic(characteristic)
+            val writeOnce = {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeCharacteristic(
+                        characteristic,
+                        data,
+                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    ) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = data
+                    @Suppress("DEPRECATION")
+                    gatt.writeCharacteristic(characteristic)
+                }
+            }
+            // 写不起来多半是 GATT 上一个操作（读、CCCD、上一包写入）还没回调，系统同一时间只接一个；
+            // 等一下再试，而不是立刻报发送失败让 SAR 整个会话重来。
+            var writeStarted = writeOnce()
+            var attempts = 0
+            while (!writeStarted && attempts < BLE_WRITE_BUSY_RETRIES) {
+                attempts++
+                delay(BLE_WRITE_BUSY_RETRY_DELAY_MS)
+                if (bleGatt !== gatt) {
+                    return@withLock false to "BLE GATT disconnected"
+                }
+                writeStarted = writeOnce()
             }
             if (!writeStarted) {
                 return@withLock false to "BLE write failed to start"
@@ -958,6 +1074,8 @@ class BTSpp(private val context: Context, private val webView: WebView) {
         bleMtuDeferred = null
         bleDescriptorWriteDeferred?.complete(false)
         bleDescriptorWriteDeferred = null
+        bleReadDeferred?.complete(false)
+        bleReadDeferred = null
 
         runCatching { bleGatt?.disconnect() }
         runCatching { bleGatt?.close() }
